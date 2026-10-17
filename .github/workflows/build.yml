@@ -1,1 +1,1378 @@
+name: build-oxcheat
+# 1) этот файл положить в репо как .github/workflows/build.yml
+# 2) вкладка Actions -> build-oxcheat -> Run workflow
+# 3) через ~3 мин внизу страницы запуска: Artifacts -> oxcheat (zip) -> внутри oxcheat_run.sh
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: fetch sources (imgui v1.93.0 + enenH/AndroidImgui, pinned)
+        run: |
+          set -e
+          git clone -q https://github.com/ocornut/imgui imgui && git -C imgui checkout -q c1aaac65e896a45f81f47a4d68f9959e0f86c859
+          git clone -q https://github.com/enenH/AndroidImgui aimgui && git -C aimgui checkout -q 63c9d83620665f87dce26e0a6de9f209b6d69593
+          I=$PWD/include
+          mkdir -p $I/ImGui/backends $I/native_surface $I/Android_touch
+          cp imgui/imgui*.cpp imgui/imgui*.h imgui/imstb_*.h imgui/imconfig.h $I/ImGui/ ; rm -f $I/ImGui/imgui_demo.cpp
+          cp imgui/backends/imgui_impl_android.* imgui/backends/imgui_impl_opengl3.* imgui/backends/imgui_impl_opengl3_loader.h $I/ImGui/backends/
+          cp aimgui/src/VectorStruct.h aimgui/test/TouchHelperA.h aimgui/test/TouchHelperA.cpp aimgui/test/Utils.h aimgui/test/Log.h aimgui/test/spinlock.h $I/Android_touch/
+          cat > $I/native_surface/ANativeWindowCreator.h <<'OXEOF'
+          #ifndef A_NATIVE_WINDOW_CREATOR_H
+          #define A_NATIVE_WINDOW_CREATOR_H
 
+          #include <android/native_window.h>
+          #include <dlfcn.h>
+          #include <sys/system_properties.h>
+
+          #include <cstddef>
+          #include <unordered_map>
+          #include <string>
+          #include <vector>
+
+          #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature) \
+              ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));
+
+          namespace anwc {
+              namespace detail {
+                  namespace ui {
+                      struct LayerStack {
+                          uint32_t id = UINT32_MAX;
+                      };
+
+                      enum class Rotation {
+                          Rotation0 = 0,
+                          Rotation90 = 1,
+                          Rotation180 = 2,
+                          Rotation270 = 3
+                      };
+
+                      struct Size {
+                          int32_t width = -1;
+                          int32_t height = -1;
+                      };
+
+                      struct DisplayState {
+                          LayerStack layerStack;
+                          Rotation orientation = Rotation::Rotation0;
+                          Size layerStackSpaceRect;
+                      };
+
+                      typedef int64_t nsecs_t;
+                      struct DisplayInfo {
+                          uint32_t w{0};
+                          uint32_t h{0};
+                          float xdpi{0};
+                          float ydpi{0};
+                          float fps{0};
+                          float density{0};
+                          uint8_t orientation{0};
+                          bool secure{false};
+                          nsecs_t appVsyncOffset{0};
+                          nsecs_t presentationDeadline{0};
+                          uint32_t viewportW{0};
+                          uint32_t viewportH{0};
+                      };
+
+                      enum class DisplayType {
+                          DisplayIdMain = 0,
+                          DisplayIdHdmi = 1
+                      };
+
+                      struct PhysicalDisplayId {
+                          uint64_t value;
+                      };
+                  }
+
+                  struct String8;
+                  struct LayerMetadata;
+                  struct Surface;
+                  struct SurfaceControl;
+                  struct SurfaceComposerClientTransaction;
+                  struct SurfaceComposerClient;
+
+                  template<typename any_t>
+                  struct StrongPointer {
+                      union {
+                          any_t *pointer;
+                          char padding[sizeof(std::max_align_t)];
+                      };
+
+                      inline any_t *operator->() const { return pointer; }
+                      inline any_t *get() const { return pointer; }
+                      inline explicit operator bool() const { return nullptr != pointer; }
+                  };
+
+                  static inline void ApplyOrientationSwap(int32_t &outWidth, int32_t &outHeight, const ui::DisplayState &state) {
+                      uint32_t orient = static_cast<uint32_t>(state.orientation);
+                      if (orient == 1 || orient == 3) {
+                          outWidth  = state.layerStackSpaceRect.height;
+                          outHeight = state.layerStackSpaceRect.width;
+                      } else {
+                          outWidth  = state.layerStackSpaceRect.width;
+                          outHeight = state.layerStackSpaceRect.height;
+                      }
+                  }
+
+                  struct Functionals {
+                      struct SymbolMethod {
+                          void *(*Open)(const char *filename, int flag) = nullptr;
+                          void *(*Find)(void *handle, const char *symbol) = nullptr;
+                          int (*Close)(void *handle) = nullptr;
+                      };
+
+                      size_t systemVersion = 13;
+
+                      void (*RefBase__IncStrong)(void *thiz, void *id) = nullptr;
+                      void (*RefBase__DecStrong)(void *thiz, void *id) = nullptr;
+                      void (*String8__Constructor)(void *thiz, const char *const data) = nullptr;
+                      void (*String8__Destructor)(void *thiz) = nullptr;
+                      void (*LayerMetadata__Constructor)(void *thiz) = nullptr;
+                      void (*LayerMetadata__setInt32)(void *thiz, uint32_t type, int32_t value) = nullptr;
+                      void (*SurfaceComposerClient__Constructor)(void *thiz) = nullptr;
+                      void (*SurfaceComposerClient__Destructor)(void *thiz) = nullptr;
+
+                      StrongPointer<void>(*SurfaceComposerClient__CreateSurface)(void *thiz, void *name, uint32_t w, uint32_t h,
+                                                                                  int32_t format, uint32_t flags, void *parentHandle,
+                                                                                  void *layerMetadata, uint32_t *outTransformHint) = nullptr;
+
+                      StrongPointer<void>(*SurfaceComposerClient__GetInternalDisplayToken)() = nullptr;
+                      StrongPointer<void>(*SurfaceComposerClient__GetBuiltInDisplay)(ui::DisplayType type) = nullptr;
+                      int32_t(*SurfaceComposerClient__GetDisplayState)(StrongPointer<void> &display, ui::DisplayState *displayState) = nullptr;
+                      int32_t(*SurfaceComposerClient__GetDisplayInfo)(StrongPointer<void> &display, ui::DisplayInfo *displayInfo) = nullptr;
+                      std::vector<ui::PhysicalDisplayId>(*SurfaceComposerClient__GetPhysicalDisplayIds)() = nullptr;
+                      StrongPointer<void>(*SurfaceComposerClient__GetPhysicalDisplayToken)(ui::PhysicalDisplayId displayId) = nullptr;
+                      void(*SurfaceComposerClient__Transaction__Constructor)(void *thiz) = nullptr;
+                      void *(*SurfaceComposerClient__Transaction__SetLayer)(void *thiz, StrongPointer<void> &surfaceControl, int32_t z) = nullptr;
+                      void *(*SurfaceComposerClient__Transaction__SetTrustedOverlay)(void *thiz, StrongPointer<void> &surfaceControl, bool isTrustedOverlay) = nullptr;
+                      int32_t(*SurfaceComposerClient__Transaction__Apply)(void *thiz, bool synchronous, bool oneWay) = nullptr;
+                      void *(*SurfaceComposerClient__Transaction__SetFlags)(void *thiz, StrongPointer<void> &surfaceControl, uint32_t flags, uint32_t mask) = nullptr;
+                      int32_t(*SurfaceControl__Validate)(void *thiz) = nullptr;
+                      StrongPointer<Surface>(*SurfaceControl__GetSurface)(void *thiz) = nullptr;
+                      void(*SurfaceControl__DisConnect)(void *thiz) = nullptr;
+
+                      Functionals(const SymbolMethod &symbolMethod) {
+                          std::string ver(128, 0);
+                          ver.resize(__system_property_get("ro.build.version.release", ver.data()));
+                          if (!ver.empty())
+                              systemVersion = std::stoi(ver);
+
+                          if (systemVersion < 8)
+                              throw std::runtime_error("ANativeWindowCreator: Android < 8 is not supported");
+
+                          static std::unordered_map<size_t, std::unordered_map<void **, const char *>> patchesTable = {
+                                  {16, {
+                                          {reinterpret_cast<void **>(&LayerMetadata__Constructor),               "_ZN7android3gui13LayerMetadataC2Ev"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface),     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
+                                          {reinterpret_cast<void **>(&LayerMetadata__setInt32),                  "_ZN7android3gui13LayerMetadata8setInt32Eji"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__Transaction__SetFlags), "_ZN7android21SurfaceComposerClient11Transaction8setFlagsERKNS_2spINS_14SurfaceControlEEEjj"},
+                                  }},
+                                  {15, {
+                                          {reinterpret_cast<void **>(&LayerMetadata__Constructor),               "_ZN7android3gui13LayerMetadataC2Ev"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface),     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
+                                          {reinterpret_cast<void **>(&LayerMetadata__setInt32),                  "_ZN7android3gui13LayerMetadata8setInt32Eji"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__Transaction__SetFlags), "_ZN7android21SurfaceComposerClient11Transaction8setFlagsERKNS_2spINS_14SurfaceControlEEEjj"},
+                                  }},
+                                  {14, {
+                                          {reinterpret_cast<void **>(&LayerMetadata__Constructor),               "_ZN7android3gui13LayerMetadataC2Ev"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface),     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjiiRKNS_2spINS_7IBinderEEENS_3gui13LayerMetadataEPj"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__Transaction__SetFlags), "_ZN7android21SurfaceComposerClient11Transaction8setFlagsERKNS_2spINS_14SurfaceControlEEEjj"},
+                                  }},
+                                  {12, {
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__Transaction__Apply),    "_ZN7android21SurfaceComposerClient11Transaction5applyEb"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__Transaction__SetFlags), "_ZN7android21SurfaceComposerClient11Transaction8setFlagsERKNS_2spINS_14SurfaceControlEEEjj"},
+                                  }},
+                                  {11, {
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface), "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataEPj"},
+                                          {reinterpret_cast<void **>(&SurfaceControl__GetSurface),           "_ZNK7android14SurfaceControl10getSurfaceEv"},
+                                  }},
+                                  {10, {
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface), "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlENS_13LayerMetadataE"},
+                                          {reinterpret_cast<void **>(&SurfaceControl__GetSurface),           "_ZNK7android14SurfaceControl10getSurfaceEv"},
+                                  }},
+                                  {9, {
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface),     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlEii"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__GetBuiltInDisplay), "_ZN7android21SurfaceComposerClient17getBuiltInDisplayEi"},
+                                          {reinterpret_cast<void **>(&SurfaceControl__GetSurface),               "_ZNK7android14SurfaceControl10getSurfaceEv"},
+                                  }},
+                                  {8, {
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__CreateSurface),     "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijPNS_14SurfaceControlEjj"},
+                                          {reinterpret_cast<void **>(&SurfaceComposerClient__GetBuiltInDisplay), "_ZN7android21SurfaceComposerClient17getBuiltInDisplayEi"},
+                                          {reinterpret_cast<void **>(&SurfaceControl__GetSurface),               "_ZNK7android14SurfaceControl10getSurfaceEv"},
+                                  }},
+                          };
+
+          #ifdef __LP64__
+                          auto libgui   = symbolMethod.Open("/system/lib64/libgui.so", RTLD_LAZY);
+                          auto libutils = symbolMethod.Open("/system/lib64/libutils.so", RTLD_LAZY);
+          #else
+                          auto libgui   = symbolMethod.Open("/system/lib/libgui.so", RTLD_LAZY);
+                          auto libutils = symbolMethod.Open("/system/lib/libutils.so", RTLD_LAZY);
+          #endif
+
+                          ResolveMethod(RefBase, IncStrong, libutils, "_ZNK7android7RefBase9incStrongEPKv");
+                          ResolveMethod(RefBase, DecStrong, libutils, "_ZNK7android7RefBase9decStrongEPKv");
+                          ResolveMethod(String8, Constructor, libutils, "_ZN7android7String8C2EPKc");
+                          ResolveMethod(String8, Destructor, libutils, "_ZN7android7String8D2Ev");
+                          ResolveMethod(LayerMetadata, Constructor, libgui, "_ZN7android13LayerMetadataC2Ev");
+                          ResolveMethod(LayerMetadata, setInt32, libgui, "_ZN7android13LayerMetadata8setInt32Eji");
+                          ResolveMethod(SurfaceComposerClient, Constructor, libgui, "_ZN7android21SurfaceComposerClientC2Ev");
+                          ResolveMethod(SurfaceComposerClient, CreateSurface, libgui, "_ZN7android21SurfaceComposerClient13createSurfaceERKNS_7String8EjjijRKNS_2spINS_7IBinderEEENS_13LayerMetadataEPj");
+                          ResolveMethod(SurfaceComposerClient, GetInternalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getInternalDisplayTokenEv");
+                          ResolveMethod(SurfaceComposerClient, GetDisplayState, libgui, "_ZN7android21SurfaceComposerClient15getDisplayStateERKNS_2spINS_7IBinderEEEPNS_2ui12DisplayStateE");
+                          ResolveMethod(SurfaceComposerClient, GetDisplayInfo, libgui, "_ZN7android21SurfaceComposerClient14getDisplayInfoERKNS_2spINS_7IBinderEEEPNS_11DisplayInfoE");
+                          ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayIds, libgui, "_ZN7android21SurfaceComposerClient21getPhysicalDisplayIdsEv");
+                          ResolveMethod(SurfaceComposerClient, GetPhysicalDisplayToken, libgui, "_ZN7android21SurfaceComposerClient23getPhysicalDisplayTokenENS_17PhysicalDisplayIdE");
+                          ResolveMethod(SurfaceComposerClient__Transaction, Constructor, libgui, "_ZN7android21SurfaceComposerClient11TransactionC2Ev");
+                          ResolveMethod(SurfaceComposerClient__Transaction, SetLayer, libgui, "_ZN7android21SurfaceComposerClient11Transaction8setLayerERKNS_2spINS_14SurfaceControlEEEi");
+                          ResolveMethod(SurfaceComposerClient__Transaction, SetTrustedOverlay, libgui, "_ZN7android21SurfaceComposerClient11Transaction17setTrustedOverlayERKNS_2spINS_14SurfaceControlEEEb");
+                          ResolveMethod(SurfaceComposerClient__Transaction, Apply, libgui, "_ZN7android21SurfaceComposerClient11Transaction5applyEbb");
+                          ResolveMethod(SurfaceComposerClient__Transaction, SetFlags, libgui, "_ZN7android21SurfaceComposerClient11Transaction8setFlagsERKNS_2spINS_14SurfaceControlEEEjj");
+                          ResolveMethod(SurfaceControl, Validate, libgui, "_ZNK7android14SurfaceControl8validateEv");
+                          ResolveMethod(SurfaceControl, GetSurface, libgui, "_ZN7android14SurfaceControl10getSurfaceEv");
+                          ResolveMethod(SurfaceControl, DisConnect, libgui, "_ZN7android14SurfaceControl10disconnectEv");
+
+                          auto it = patchesTable.find(systemVersion);
+                          if (it != patchesTable.end()) {
+                              for (const auto &[patchTo, signature] : it->second) {
+                                  void *resolved = symbolMethod.Find(libgui, signature);
+                                  if (resolved != nullptr)
+                                      *patchTo = resolved;
+                              }
+                          }
+
+                          symbolMethod.Close(libutils);
+                          symbolMethod.Close(libgui);
+                      }
+
+                      static const Functionals &GetInstance(const SymbolMethod &symbolMethod = {.Open = dlopen, .Find = dlsym, .Close = dlclose}) {
+                          static Functionals functionals(symbolMethod);
+                          return functionals;
+                      }
+                  };
+
+                  struct String8 {
+                      char data[1024];
+
+                      String8(const char *const string) { Functionals::GetInstance().String8__Constructor(data, string); }
+                      ~String8() { Functionals::GetInstance().String8__Destructor(data); }
+                      operator void *() { return reinterpret_cast<void *>(data); }
+                  };
+
+                  struct LayerMetadata {
+                      char data[1024];
+
+                      LayerMetadata() {
+                          if (9 < Functionals::GetInstance().systemVersion)
+                              Functionals::GetInstance().LayerMetadata__Constructor(data);
+                      }
+
+                      void setInt32(uint32_t type, int32_t value) {
+                          if (9 < Functionals::GetInstance().systemVersion)
+                              Functionals::GetInstance().LayerMetadata__setInt32(data, type, value);
+                      }
+
+                      operator void *() {
+                          return 9 < Functionals::GetInstance().systemVersion ? reinterpret_cast<void *>(data) : nullptr;
+                      }
+                  };
+
+                  struct Surface {};
+
+                  struct SurfaceControl {
+                      void *data;
+
+                      SurfaceControl() : data(nullptr) {}
+                      SurfaceControl(void *data) : data(data) {}
+
+                      int32_t Validate() {
+                          return nullptr == data ? 0 : Functionals::GetInstance().SurfaceControl__Validate(data);
+                      }
+
+                      Surface *GetSurface() {
+                          if (nullptr == data) return nullptr;
+                          auto result = Functionals::GetInstance().SurfaceControl__GetSurface(data);
+                          return reinterpret_cast<Surface *>(reinterpret_cast<size_t>(result.pointer) + sizeof(std::max_align_t) / 2);
+                      }
+
+                      void DisConnect() {
+                          if (nullptr != data)
+                              Functionals::GetInstance().SurfaceControl__DisConnect(data);
+                      }
+
+                      void DestroySurface(Surface *surface) {
+                          if (nullptr == data || nullptr == surface) return;
+                          Functionals::GetInstance().RefBase__DecStrong(
+                                  reinterpret_cast<Surface *>(reinterpret_cast<size_t>(surface) - sizeof(std::max_align_t) / 2), this);
+                          DisConnect();
+                          Functionals::GetInstance().RefBase__DecStrong(data, this);
+                      }
+                  };
+
+                  struct SurfaceComposerClientTransaction {
+                      char data[1024];
+
+                      SurfaceComposerClientTransaction() { Functionals::GetInstance().SurfaceComposerClient__Transaction__Constructor(data); }
+
+                      void *SetLayer(StrongPointer<void> &sc, int32_t z) {
+                          return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetLayer(data, sc, z);
+                      }
+
+                      void *SetTrustedOverlay(StrongPointer<void> &sc, bool trusted) {
+                          return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetTrustedOverlay(data, sc, trusted);
+                      }
+
+                      void *SetFlags(StrongPointer<void> &sc, uint32_t flags, uint32_t mask) {
+                          if (nullptr == Functionals::GetInstance().SurfaceComposerClient__Transaction__SetFlags) return nullptr;
+                          return Functionals::GetInstance().SurfaceComposerClient__Transaction__SetFlags(data, sc, flags, mask);
+                      }
+
+                      int32_t Apply(bool synchronous, bool oneWay) {
+                          if (12 >= Functionals::GetInstance().systemVersion)
+                              return reinterpret_cast<int32_t (*)(void *, bool)>(
+                                      Functionals::GetInstance().SurfaceComposerClient__Transaction__Apply)(data, synchronous);
+                          return Functionals::GetInstance().SurfaceComposerClient__Transaction__Apply(data, synchronous, oneWay);
+                      }
+                  };
+
+                  struct SurfaceComposerClient {
+                      char data[1024];
+
+                      SurfaceComposerClient() {
+                          Functionals::GetInstance().SurfaceComposerClient__Constructor(data);
+                          Functionals::GetInstance().RefBase__IncStrong(data, this);
+                      }
+
+                      ~SurfaceComposerClient() {
+                          Functionals::GetInstance().SurfaceComposerClient__Destructor(data);
+                      }
+
+                      SurfaceControl CreateSurface(const char *name, int32_t width, int32_t height, bool hide, bool) {
+                          void *parentHandle = nullptr;
+                          String8 windowName(name);
+                          LayerMetadata layerMetadata;
+                          uint32_t flags = 0;
+
+                          if (12 <= Functionals::GetInstance().systemVersion) {
+                              static void *fakeParentHandleForBinder = nullptr;
+                              parentHandle = &fakeParentHandleForBinder;
+                          }
+
+                          StrongPointer<void> result{};
+                          if (Functionals::GetInstance().systemVersion <= 9) {
+                              int value = hide ? 441731 : -1;
+                              result = reinterpret_cast<StrongPointer<void> (*)(void *, void *, uint32_t, uint32_t, int32_t, uint32_t, void *, int32_t, int32_t)>(
+                                      Functionals::GetInstance().SurfaceComposerClient__CreateSurface)(data, windowName, width, height, 1, flags, nullptr, value, -1);
+                          } else {
+                              if (hide) {
+                                  if (Functionals::GetInstance().systemVersion < 12)
+                                      layerMetadata.setInt32(2, 441731);
+                                  else
+                                      flags = 0x40;
+                              }
+                              result = Functionals::GetInstance().SurfaceComposerClient__CreateSurface(data, windowName, width, height, 1, flags, parentHandle, layerMetadata, nullptr);
+                          }
+
+                          if (12 <= Functionals::GetInstance().systemVersion) {
+                              static SurfaceComposerClientTransaction transaction;
+                              transaction.SetTrustedOverlay(result, true);
+                              transaction.Apply(false, true);
+                          }
+
+                          return {result.get()};
+                      }
+
+                      bool GetDisplayInfo(ui::DisplayState *displayState) {
+                          StrongPointer<void> defaultDisplay;
+
+                          if (9 >= Functionals::GetInstance().systemVersion) {
+                              defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetBuiltInDisplay(ui::DisplayType::DisplayIdMain);
+                          } else if (14 > Functionals::GetInstance().systemVersion) {
+                              defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetInternalDisplayToken();
+                          } else {
+                              auto displayIds = Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayIds();
+                              if (displayIds.empty()) return false;
+                              defaultDisplay = Functionals::GetInstance().SurfaceComposerClient__GetPhysicalDisplayToken(displayIds[0]);
+                          }
+
+                          if (nullptr == defaultDisplay.get()) return false;
+
+                          if (11 <= Functionals::GetInstance().systemVersion) {
+                              return 0 == Functionals::GetInstance().SurfaceComposerClient__GetDisplayState(defaultDisplay, displayState);
+                          } else {
+                              ui::DisplayInfo legacyInfo{};
+                              if (0 != Functionals::GetInstance().SurfaceComposerClient__GetDisplayInfo(defaultDisplay, &legacyInfo))
+                                  return false;
+                              displayState->layerStackSpaceRect.width  = static_cast<int32_t>(legacyInfo.w);
+                              displayState->layerStackSpaceRect.height = static_cast<int32_t>(legacyInfo.h);
+                              displayState->orientation = static_cast<ui::Rotation>(legacyInfo.orientation);
+                              return true;
+                          }
+                      }
+                  };
+              }
+
+              class ANativeWindowCreator {
+              public:
+                  struct DisplayInfo {
+                      uint32_t orientation;
+                      int32_t width;
+                      int32_t height;
+                  };
+
+                  static detail::SurfaceComposerClient &GetComposerInstance() {
+                      static detail::SurfaceComposerClient surfaceComposerClient;
+                      return surfaceComposerClient;
+                  }
+
+                  static DisplayInfo GetDisplayInfo() {
+                      detail::ui::DisplayState displayState{};
+                      if (!GetComposerInstance().GetDisplayInfo(&displayState))
+                          return {};
+
+                      DisplayInfo result{};
+                      result.orientation = static_cast<uint32_t>(displayState.orientation);
+                      if (detail::Functionals::GetInstance().systemVersion <= 10)
+                          detail::ApplyOrientationSwap(result.width, result.height, displayState);
+                      else {
+                          result.width  = displayState.layerStackSpaceRect.width;
+                          result.height = displayState.layerStackSpaceRect.height;
+                      }
+                      return result;
+                  }
+
+                  static ANativeWindow *Create(const char *name, int32_t width = -1, int32_t height = -1, bool hide = true) {
+                      auto &client = GetComposerInstance();
+
+                      if (-1 == width || -1 == height) {
+                          detail::ui::DisplayState displayState{};
+                          if (client.GetDisplayInfo(&displayState)) {
+                              if (detail::Functionals::GetInstance().systemVersion <= 10)
+                                  detail::ApplyOrientationSwap(width, height, displayState);
+                              else {
+                                  width  = displayState.layerStackSpaceRect.width;
+                                  height = displayState.layerStackSpaceRect.height;
+                              }
+                          }
+                      }
+
+                      auto surfaceControl = client.CreateSurface(name, width, height, hide, false);
+                      auto nativeWindow   = reinterpret_cast<ANativeWindow *>(surfaceControl.GetSurface());
+                      m_cachedSurfaceControl.emplace(nativeWindow, surfaceControl);
+                      return nativeWindow;
+                  }
+
+                  static void Destroy(ANativeWindow *nativeWindow) {
+                      auto it = m_cachedSurfaceControl.find(nativeWindow);
+                      if (it == m_cachedSurfaceControl.end())
+                          return;
+                      it->second.DestroySurface(reinterpret_cast<detail::Surface *>(nativeWindow));
+                      m_cachedSurfaceControl.erase(it);
+                  }
+
+              private:
+                  inline static std::unordered_map<ANativeWindow *, detail::SurfaceControl> m_cachedSurfaceControl;
+              };
+          }
+
+          #undef ResolveMethod
+
+          #endif
+          OXEOF
+          cat >> $I/Android_touch/TouchHelperA.h <<'OXEOF'
+
+          // ── shim: API that cheat.cpp expects ──
+          #include "ANativeWindowCreator.h"
+          inline bool Touch_Init(int w, int h, int /*orient*/, bool readOnly) {
+              Touch::setOrientation((int)anwc::ANativeWindowCreator::GetDisplayInfo().orientation);
+              return Touch::Init(Vector2((float)w, (float)h), readOnly);
+          }
+          inline void Touch_UpdateImGui() {    // reader thread already writes io.MousePos/MouseDown; here: keep rotation fresh
+              static int n = 0;
+              if (++n % 30 == 0) Touch::setOrientation((int)anwc::ANativeWindowCreator::GetDisplayInfo().orientation);
+          }
+          inline void Touch_Close() { Touch::Close(); }
+          OXEOF
+          cat > cheat.cpp <<'OXEOF'
+          // cheat.cpp | arm64 Android | Oxide: Survival Island | ESP
+          //
+          // ONE source, TWO binaries (built by oxcheat.sh):
+          //   libcheat.so  (-DPAYLOAD)  injected into the game. il2cpp collector only, no UI.
+          //                             writes entity screen coords into a shared file (SHM_PATH).
+          //   oxcheat      (-DHOST)     root process. ptrace-injects libcheat.so, then draws the overlay
+          //                             (SurfaceFlinger surface + EGL/GLES3 + ImGui + evdev touch) from the shared file.
+          // why split: libgui (needed to create the overlay surface) is private -> an app process can't dlopen it
+          //            (linker namespace), and /dev/input needs root. so UI lives in the root process, game-side stays tiny.
+          //
+          // build (oxcheat.sh does this):
+          //   clang++ -shared -fPIC -O2 -std=c++20 -fvisibility=hidden -DPAYLOAD -fno-exceptions -fno-rtti -nostdlib++ \
+          //           cheat.cpp -ldl -llog -lm -Wl,--no-undefined -o libcheat.so
+          //   clang++ -O2 -std=c++20 -DHOST cheat.cpp <imgui cpps> <touch cpp> -Iinclude ... -llog -ldl -landroid -lEGL -lGLESv3 -o oxcheat
+          //
+          // run:  su -c /data/local/tmp/oxcheat      (menu: tap [M] in the corner)
+
+          // ═══════════════════════════════════════════════════════════════════════════
+          //  OFFSETS / CONFIG — единый блок, меняй здесь
+          // ═══════════════════════════════════════════════════════════════════════════
+          namespace off {
+              constexpr const char* PKG        = "com.catsbit.oxidesurvivalisland";
+              constexpr const char* IL2CPP_NS  = "Oxide";
+              constexpr const char* IL2CPP_CLS = "PlayerManager";
+              constexpr const char* F_EVENTS   = "playerEventHandler";
+              constexpr const char* F_HEALTH   = "Health";
+              constexpr const char* F_TEAM     = "teamName";
+              constexpr const char* M_HP_A     = "Kek";   // FILL: obfuscated, re-dump with Il2CppDumper after each game update
+              constexpr const char* M_HP_B     = "KeA";
+              constexpr float       HEAD_H     = 1.8f;
+              constexpr int         POLL_MS    = 50;
+              constexpr int         MAX_ENT    = 64;
+              constexpr const char* CFG_PATH   = "/data/local/tmp/.oxide_cfg.json";
+              constexpr const char* LIB_DST    = "/data/data/com.catsbit.oxidesurvivalisland/cache/libcheat.so";
+              constexpr const char* SHM_PATH   = "/data/data/com.catsbit.oxidesurvivalisland/cache/.oxe.shm";
+          }
+
+          #include <stdint.h>
+          #include <stddef.h>
+
+          // ── shared between payload and host (identical layout, both compiled from this file) ──
+          struct Ent {
+              float fx, fy, hx, hy;   // feet/head screen px, Unity convention: origin bottom-left, game resolution (sw x sh)
+              float hp, hpMax, dist;
+              int   team;             // 1 = same team as local player
+              bool  alive;
+          };
+          struct Shm {
+              volatile uint32_t seq;  // seqlock: odd = writer busy
+              int32_t  cnt, sw, sh;
+              uint64_t ts_ms;         // CLOCK_MONOTONIC ms of last write, host drops stale data
+              Ent      e[off::MAX_ENT];
+          };
+
+          #ifdef PAYLOAD
+          // ═══════════════════════════════════════════════════════════════════════════
+          //  PAYLOAD — runs inside the game. pure C-style on purpose (no libc++ dependency).
+          //  this build's libil2cpp.so does NOT export il2cpp_* (241 exports are hashed), so nothing is resolved by name:
+          //  everything is base+RVA from dump.cs / fixed field offsets. REGENERATE rva:: + off2:: after every game update.
+          // ═══════════════════════════════════════════════════════════════════════════
+          #include <dlfcn.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <sys/mman.h>
+          #include <sys/stat.h>
+          #include <unistd.h>
+          #include <time.h>
+          #include <android/log.h>
+          #include <math.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "oxcheat", __VA_ARGS__)
+
+          namespace rva {                       // dump.cs "RVA:" (== VA), added to libil2cpp load base
+              constexpr uintptr_t Update       = 0x6A4FC4C;   // Oxide.PlayerManager.Update()          (private, hooked)
+              constexpr uintptr_t IsLocal      = 0xC16A71C;   // Mirror.NetworkBehaviour.get_isLocalPlayer()
+              constexpr uintptr_t CamMain      = 0xCCBE5C8;   // UnityEngine.Camera.get_main()          static
+              constexpr uintptr_t W2S          = 0xCCBDB1C;   // UnityEngine.Camera.WorldToScreenPoint(Vector3)
+              constexpr uintptr_t GetTransform = 0xCD39DD4;   // UnityEngine.Component.get_transform()
+              constexpr uintptr_t GetPosition  = 0xCD53504;   // UnityEngine.Transform.get_position()
+              constexpr uintptr_t ScrW         = 0xCCD1820;   // UnityEngine.Screen.get_width()         static
+              constexpr uintptr_t ScrH         = 0xCCD1848;   // UnityEngine.Screen.get_height()        static
+              // first 4 words of Update(): must match, they are copied into the trampoline (PC-independent, checked offline)
+              constexpr uint32_t UpdatePrologue[4] = {0xd10203ff, 0x6d0323e9, 0xa90467fe, 0xa9055ff8};
+          }
+          namespace off2 {                      // field offsets (dump.cs / il2cpp.h)
+              constexpr uintptr_t pm_events = 0x78;    // PlayerManager.playerEventHandler (hsL : hsN)
+              constexpr uintptr_t pm_vitals = 0xC8;    // PlayerManager.vitals
+              constexpr uintptr_t pm_team   = 0x2A0;   // PlayerManager.teamName (string)
+              constexpr uintptr_t ev_health = 0x98;    // hsN.Health -> hkz<float,..>
+              constexpr uintptr_t hk_value  = 0x20;    // hkz<float,..> current value; verified in libil2cpp: Kek() = ldr s0,[x0,#0x20]
+              constexpr uintptr_t gv_maxhp  = 0x88;    // GenericVitals.m_MaxHealth
+          }
+
+          struct V3 { float x, y, z; };
+          struct Name { char16_t c[64]; int n; };
+
+          static Shm* g_shm = nullptr;
+          static uintptr_t g_base = 0;
+
+          static uint64_t nowMs() {
+              timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+          }
+          static bool shmOpen() {
+              int fd = open(off::SHM_PATH, O_RDWR | O_CREAT, 0666);
+              if (fd < 0) { LOG("shm open failed"); return false; }
+              fchmod(fd, 0666);
+              if (ftruncate(fd, sizeof(Shm)) != 0) { close(fd); return false; }
+              void* p = mmap(nullptr, sizeof(Shm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+              close(fd);
+              if (p == MAP_FAILED) return false;
+              g_shm = (Shm*)p;
+              if (g_shm->seq & 1) g_shm->seq++;
+              return true;
+          }
+          static void publish(const Ent* e, int cnt, int sw, int sh) {
+              if (!g_shm) return;
+              g_shm->seq++; __sync_synchronize();
+              if (cnt > 0) memcpy(g_shm->e, e, (size_t)cnt * sizeof(Ent));
+              g_shm->cnt = cnt; g_shm->sw = sw; g_shm->sh = sh; g_shm->ts_ms = nowMs();
+              __sync_synchronize(); g_shm->seq++;
+          }
+
+          // il2cpp string: int32 length @0x10, utf16 @0x14
+          static Name readName(void* s) {
+              Name r; r.n = 0;
+              if (!s) return r;
+              int len = *(int*)((uintptr_t)s + 0x10);
+              if (len <= 0 || len > 64) return r;
+              memcpy(r.c, (void*)((uintptr_t)s + 0x14), (size_t)len * 2);
+              r.n = len; return r;
+          }
+          static bool sameName(const Name& a, const Name& b) {
+              return a.n > 0 && a.n == b.n && memcmp(a.c, b.c, (size_t)a.n * 2) == 0;
+          }
+
+          // ── minimal arm64 inline hook (16-byte patch, prologue verified against this build) ──
+          static bool patchCode(uintptr_t addr, const void* data, size_t n) {
+              long ps = sysconf(_SC_PAGESIZE);
+              uintptr_t s = addr & ~(uintptr_t)(ps - 1), e = (addr + n + (uintptr_t)ps - 1) & ~(uintptr_t)(ps - 1);
+              if (mprotect((void*)s, e - s, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                  memcpy((void*)addr, data, n);
+                  mprotect((void*)s, e - s, PROT_READ | PROT_EXEC);
+                  __builtin___clear_cache((char*)addr, (char*)(addr + n));
+                  return true;
+              }
+              int fd = open("/proc/self/mem", O_RDWR);                 // fallback: selinux denied execmod, write through /proc/self/mem
+              if (fd >= 0) {
+                  ssize_t w = pwrite(fd, data, n, (off_t)addr); close(fd);
+                  if (w == (ssize_t)n) { __builtin___clear_cache((char*)addr, (char*)(addr + n)); return true; }
+              }
+              return false;
+          }
+          static void* hookArm64(uintptr_t target, void* hook, const uint32_t expect[4]) {
+              uint32_t cur[4]; memcpy(cur, (void*)target, 16);
+              if (memcmp(cur, expect, 16) != 0) { LOG("prologue mismatch %08x %08x %08x %08x -> game updated, regen rva::", cur[0], cur[1], cur[2], cur[3]); return nullptr; }
+              uint32_t* tr = (uint32_t*)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              if (tr == MAP_FAILED) { LOG("trampoline mmap failed"); return nullptr; }
+              memcpy(tr, cur, 16);                                     // original first 4 instructions
+              tr[4] = 0x58000050;                                      // ldr x16, #8
+              tr[5] = 0xD61F0200;                                      // br  x16
+              uint64_t back = (uint64_t)target + 16; memcpy(&tr[6], &back, 8);
+              __builtin___clear_cache((char*)tr, (char*)(tr + 8));
+              uint32_t patch[4] = {0x58000050, 0xD61F0200, 0, 0};      // ldr x16,#8 ; br x16 ; .quad hook
+              uint64_t h = (uint64_t)hook; memcpy(&patch[2], &h, 8);
+              if (!patchCode(target, patch, 16)) { LOG("patch failed (mprotect + /proc/self/mem both denied)"); return nullptr; }
+              return tr;
+          }
+
+          // ── game function pointers (base + rva) ──
+          typedef bool  (*BoolFn)(void*, void*);
+          typedef int   (*IntFn)(void*);
+          typedef void* (*ObjFn0)(void*);
+          typedef void* (*ObjFn1)(void*, void*);
+          typedef V3    (*PosFn)(void*, void*);
+          typedef V3    (*W2SFn)(void*, V3, void*);
+
+          static BoolFn fIsLocal; static IntFn fScrW, fScrH; static ObjFn0 fCamMain;
+          static ObjFn1 fGetTransform; static PosFn fGetPosition; static W2SFn fW2S;
+          static void (*orig_update)(void*, void*) = nullptr;
+
+          struct Slot { void* obj; uint64_t ts; Ent e; };
+          static Slot g_slots[off::MAX_ENT];
+          static Name g_localTeam;
+          static int  g_sw = 0, g_sh = 0;
+          static uint64_t g_lastPub = 0;
+
+          static Slot* slotFor(void* obj, uint64_t now) {
+              Slot* freeS = nullptr; Slot* oldest = &g_slots[0];
+              for (int i = 0; i < off::MAX_ENT; i++) {
+                  Slot& s = g_slots[i];
+                  if (s.obj == obj) return &s;
+                  if (!s.obj || now - s.ts > 2000) { if (!freeS) freeS = &s; }
+                  if (s.ts < oldest->ts) oldest = &s;
+              }
+              Slot* s = freeS ? freeS : oldest;
+              s->obj = obj; s->ts = 0; return s;
+          }
+          static void dropSlot(void* obj) {
+              for (int i = 0; i < off::MAX_ENT; i++) if (g_slots[i].obj == obj) { g_slots[i].obj = nullptr; g_slots[i].ts = 0; }
+          }
+
+          // runs on the Unity main thread, once per PlayerManager per frame
+          static void hk_update(void* self, void* mi) {
+              orig_update(self, mi);
+              if (!self) return;
+              uint64_t now = nowMs();
+
+              if (fIsLocal(self, nullptr)) {
+                  g_localTeam = readName(*(void**)((uintptr_t)self + off2::pm_team));
+                  g_sw = fScrW(nullptr); g_sh = fScrH(nullptr);
+              } else do {
+                  void* ev = *(void**)((uintptr_t)self + off2::pm_events);                 if (!ev) break;
+                  void* hk = *(void**)((uintptr_t)ev + off2::ev_health);                   if (!hk) break;
+                  float hp = *(float*)((uintptr_t)hk + off2::hk_value);
+                  if (!(hp > 0.f) || hp > 1.0e6f) break;
+                  float hpMax = 100.f;
+                  void* vit = *(void**)((uintptr_t)self + off2::pm_vitals);
+                  if (vit) { float v = *(float*)((uintptr_t)vit + off2::gv_maxhp); if (v > 1.f && v < 100000.f) hpMax = v; }
+
+                  void* cam = fCamMain(nullptr);                                           if (!cam) break;
+                  void* ct  = fGetTransform(cam, nullptr);                                 if (!ct) break;
+                  void* tr  = fGetTransform(self, nullptr);                                if (!tr) break;
+                  V3 cp = fGetPosition(ct, nullptr), p = fGetPosition(tr, nullptr);
+                  V3 sf = fW2S(cam, p, nullptr);                                           // unity: px, origin bottom-left, z<=0 behind camera
+                  V3 sk = fW2S(cam, V3{p.x, p.y + off::HEAD_H, p.z}, nullptr);
+                  if (sf.z <= 0.f || sk.z <= 0.f) break;
+
+                  Slot* s = slotFor(self, now);
+                  Ent& e = s->e;
+                  e.fx = sf.x; e.fy = sf.y; e.hx = sk.x; e.hy = sk.y;
+                  e.hp = hp; e.hpMax = hpMax;
+                  e.dist = sqrtf((p.x - cp.x) * (p.x - cp.x) + (p.y - cp.y) * (p.y - cp.y) + (p.z - cp.z) * (p.z - cp.z));
+                  Name t = readName(*(void**)((uintptr_t)self + off2::pm_team));
+                  e.team = sameName(t, g_localTeam) ? 1 : 0;
+                  e.alive = true;
+                  s->ts = now;
+                  goto published;
+              } while (0);
+              dropSlot(self);
+          published:
+              if (now - g_lastPub >= 8 && g_sw > 0 && g_sh > 0) {
+                  g_lastPub = now;
+                  Ent tmp[off::MAX_ENT]; int cnt = 0;
+                  for (int i = 0; i < off::MAX_ENT; i++)
+                      if (g_slots[i].obj && now - g_slots[i].ts < 250) tmp[cnt++] = g_slots[i].e;
+                  publish(tmp, cnt, g_sw, g_sh);
+              }
+          }
+
+          static uintptr_t findBase(const char* lib) {
+              FILE* f = fopen("/proc/self/maps", "r"); if (!f) return 0;
+              char line[512]; uintptr_t base = 0;
+              while (fgets(line, sizeof(line), f)) {
+                  unsigned long lo, hi, offs;
+                  if (sscanf(line, "%lx-%lx %*s %lx", &lo, &hi, &offs) == 3 && offs == 0 && strstr(line, lib)) { base = lo; break; }
+              }
+              fclose(f); return base;
+          }
+
+          static void* init_thread(void*) {
+              for (int i = 0; i < 240 && !(g_base = findBase("libil2cpp.so")); i++) sleep(1);
+              if (!g_base) { LOG("libil2cpp not found"); return nullptr; }
+              sleep(6);                                                // let the game finish its own startup first
+              if (!shmOpen()) return nullptr;
+              LOG("il2cpp base %#lx", (unsigned long)g_base);
+
+              fIsLocal = (BoolFn)(g_base + rva::IsLocal);
+              fScrW = (IntFn)(g_base + rva::ScrW); fScrH = (IntFn)(g_base + rva::ScrH);
+              fCamMain = (ObjFn0)(g_base + rva::CamMain);
+              fGetTransform = (ObjFn1)(g_base + rva::GetTransform);
+              fGetPosition = (PosFn)(g_base + rva::GetPosition);
+              fW2S = (W2SFn)(g_base + rva::W2S);
+
+              void* tramp = hookArm64(g_base + rva::Update, (void*)hk_update, rva::UpdatePrologue);
+              if (!tramp) return nullptr;
+              orig_update = (void (*)(void*, void*))tramp;
+              LOG("collector up (hooked PlayerManager.Update)");
+              return nullptr;
+          }
+
+          __attribute__((constructor)) static void ctor() {
+              pthread_t t;
+              pthread_create(&t, nullptr, init_thread, nullptr);
+              pthread_detach(t);
+          }
+
+          #else
+          // ═══════════════════════════════════════════════════════════════════════════
+          //  HOST — root process: injector + overlay
+          // ═══════════════════════════════════════════════════════════════════════════
+          #include <dirent.h>
+          #include <dlfcn.h>
+          #include <elf.h>
+          #include <fcntl.h>
+          #include <signal.h>
+          #include <ucontext.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <sys/mman.h>
+          #include <sys/ptrace.h>
+          #include <sys/stat.h>
+          #include <sys/uio.h>
+          #include <sys/wait.h>
+          #include <unistd.h>
+          #include <android/log.h>
+          #include <android/native_window.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <algorithm>
+          #include <cmath>
+          #include <cstring>
+          #include <initializer_list>
+          #include <string>
+          #include "ImGui/imgui.h"
+          #include "ImGui/backends/imgui_impl_android.h"
+          #include "ImGui/backends/imgui_impl_opengl3.h"
+          #include "Android_touch/TouchHelperA.h"
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "oxcheat", __VA_ARGS__)
+
+          #ifndef NT_ARM_SYSTEM_CALL
+          #define NT_ARM_SYSTEM_CALL 0x404
+          #endif
+
+          // ── injector (ptrace + remote dlopen) ─────────────────────────────────────
+          struct Regs { uint64_t x[31]; uint64_t sp, pc, pstate; };
+
+          static bool getRegs(pid_t t, Regs& r) { iovec io{&r, sizeof(r)}; return ptrace(PTRACE_GETREGSET, t, (void*)NT_PRSTATUS, &io) == 0; }
+          static bool setRegs(pid_t t, Regs& r) { iovec io{&r, sizeof(r)}; return ptrace(PTRACE_SETREGSET, t, (void*)NT_PRSTATUS, &io) == 0; }
+          static int  getSys (pid_t t)          { int n = -1; iovec io{&n, sizeof(n)}; ptrace(PTRACE_GETREGSET, t, (void*)NT_ARM_SYSTEM_CALL, &io); return n; }
+          static void setSys (pid_t t, int n)   { iovec io{&n, sizeof(n)}; ptrace(PTRACE_SETREGSET, t, (void*)NT_ARM_SYSTEM_CALL, &io); }
+
+          static pid_t findPid(const char* pkg) {
+              DIR* d = opendir("/proc"); if (!d) return 0;
+              pid_t found = 0;
+              while (dirent* e = readdir(d)) {
+                  pid_t p = (pid_t)atoi(e->d_name); if (p <= 0) continue;
+                  char path[64], buf[256] = {};
+                  snprintf(path, sizeof(path), "/proc/%d/cmdline", p);
+                  int fd = open(path, O_RDONLY); if (fd < 0) continue;
+                  read(fd, buf, sizeof(buf) - 1); close(fd);
+                  if (!strcmp(buf, pkg)) { found = p; break; }
+              }
+              closedir(d); return found;
+          }
+
+          static uintptr_t modBase(pid_t pid, const std::string& full) {
+              char p[64]; snprintf(p, sizeof(p), "/proc/%d/maps", pid);
+              FILE* f = fopen(p, "r"); if (!f) return 0;
+              std::string base = full.substr(full.rfind('/') == std::string::npos ? 0 : full.rfind('/') + 1);
+              char line[1024]; uintptr_t exact = 0, byName = 0;
+              while (fgets(line, sizeof(line), f)) {
+                  unsigned long lo, hi, off2; char perm[8];
+                  if (sscanf(line, "%lx-%lx %7s %lx", &lo, &hi, perm, &off2) != 4 || off2) continue;
+                  char* path = strchr(line, '/'); if (!path) continue;
+                  path[strcspn(path, "\n")] = 0;
+                  if (full == path) { exact = lo; break; }
+                  const char* b = strrchr(path, '/');
+                  if (!byName && base == (b ? b + 1 : path)) byName = lo;
+              }
+              fclose(f); return exact ? exact : byName;
+          }
+
+          static uintptr_t remoteSym(pid_t pid, void* local) {
+              Dl_info di{}; if (!dladdr(local, &di) || !di.dli_fname) return 0;
+              uintptr_t rb = modBase(pid, di.dli_fname); if (!rb) return 0;
+              return rb + ((uintptr_t)local - (uintptr_t)di.dli_fbase);
+          }
+
+          static bool memWrite(pid_t pid, uintptr_t addr, const void* buf, size_t n) {
+              char p[64]; snprintf(p, sizeof(p), "/proc/%d/mem", pid);
+              int fd = open(p, O_RDWR); if (fd < 0) return false;
+              bool ok = pwrite(fd, buf, n, (off_t)addr) == (ssize_t)n; close(fd); return ok;
+          }
+
+          static bool remoteCall(pid_t t, uintptr_t fn, std::initializer_list<uint64_t> args, uint64_t& ret, const Regs& saved) {
+              Regs r = saved; int i = 0;
+              for (uint64_t v : args) r.x[i++] = v;
+              r.x[30] = 0; r.pc = fn; r.sp = (saved.sp - 0x1000) & ~0xFull;   // lr=0 -> SIGSEGV at pc 0 marks return
+              setSys(t, -1);
+              if (!setRegs(t, r)) return false;
+              if (ptrace(PTRACE_CONT, t, 0, 0)) return false;
+              for (int k = 0; k < 64; k++) {
+                  int st; if (waitpid(t, &st, __WALL) < 0 || !WIFSTOPPED(st)) return false;
+                  int sig = WSTOPSIG(st);
+                  if (sig == SIGSEGV) break;
+                  ptrace(PTRACE_CONT, t, 0, (sig == SIGTRAP || sig == SIGSTOP) ? 0 : sig);
+              }
+              Regs o; if (!getRegs(t, o) || o.pc != 0) return false;
+              ret = o.x[0]; return true;
+          }
+
+          static bool copyFile(const char* src, const char* dst) {
+              if (!strcmp(src, dst)) return true;   // never O_TRUNC a file onto itself
+              int fi = open(src, O_RDONLY); if (fi < 0) return false;
+              int fo = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755); if (fo < 0) { close(fi); return false; }
+              char buf[65536]; ssize_t n;
+              while ((n = read(fi, buf, sizeof(buf))) > 0) if (write(fo, buf, (size_t)n) != n) { close(fi); close(fo); return false; }
+              close(fi); close(fo); return true;
+          }
+
+          static bool waitForIl2cpp(pid_t pid, int maxSec) {
+              for (int i = 0; i < maxSec; i++) {
+                  char p[64]; snprintf(p, sizeof(p), "/proc/%d/maps", pid);
+                  FILE* f = fopen(p, "r");
+                  if (f) {
+                      char line[512]; bool found = false;
+                      while (fgets(line, sizeof(line), f)) if (strstr(line, "libil2cpp.so")) { found = true; break; }
+                      fclose(f);
+                      if (found) return true;
+                  }
+                  sleep(1);
+              }
+              return false;
+          }
+
+          static bool injectLib(const char* lib) {
+              printf("[*] lib: %s\n[*] pkg: %s\n", lib, off::PKG);
+              pid_t pid = 0;
+              for (int i = 0; i < 60 && !pid; i++) {
+                  pid = findPid(off::PKG);
+                  if (!pid) { printf("[*] waiting for game...\n"); sleep(2); }
+              }
+              if (!pid) { fprintf(stderr, "[-] game not running\n"); return false; }
+              printf("[+] pid: %d\n[*] waiting for il2cpp...\n", pid);
+              if (!waitForIl2cpp(pid, 120)) { fprintf(stderr, "[-] libil2cpp not loaded\n"); return false; }
+              sleep(3);
+
+              {   // already injected? (host restarted while game kept running)
+                  char p[64]; snprintf(p, sizeof(p), "/proc/%d/maps", pid);
+                  FILE* f = fopen(p, "r");
+                  if (f) {
+                      char line[512]; bool has = false;
+                      while (fgets(line, sizeof(line), f)) if (strstr(line, "/libcheat.so")) { has = true; break; }
+                      fclose(f);
+                      if (has) { printf("[+] libcheat.so already in game, skipping inject\n"); return true; }
+                  }
+              }
+
+              printf("[*] copy -> %s\n", off::LIB_DST);
+              if (!copyFile(lib, off::LIB_DST)) { perror("copy"); return false; }
+              struct stat gst{}; stat((std::string("/data/data/") + off::PKG).c_str(), &gst);
+              chown(off::LIB_DST, gst.st_uid, gst.st_gid);
+              chmod(off::LIB_DST, 0755);
+              char cmd[512];   // selinux: give the lib the same label as the app's cache dir
+              snprintf(cmd, sizeof(cmd), "chcon \"$(stat -c %%C /data/data/%s/cache)\" %s 2>/dev/null", off::PKG, off::LIB_DST);
+              system(cmd);
+
+              if (ptrace(PTRACE_ATTACH, pid, 0, 0)) { perror("attach"); return false; }
+              int st; waitpid(pid, &st, __WALL);
+              Regs saved; getRegs(pid, saved); int savedSys = getSys(pid);
+              bool ok = false;
+              uintptr_t rdlopen = remoteSym(pid, (void*)dlopen);
+              if (!rdlopen) fprintf(stderr, "[-] remote dlopen not found\n");
+              else {
+                  uintptr_t str = (saved.sp - 0x800) & ~0xFull;
+                  uint64_t h = 0;
+                  if (!memWrite(pid, str, off::LIB_DST, strlen(off::LIB_DST) + 1)) perror("write path");
+                  else if (!remoteCall(pid, rdlopen, {str, (uint64_t)RTLD_NOW}, h, saved)) fprintf(stderr, "[-] remote call failed\n");
+                  else if (!h) fprintf(stderr, "[-] dlopen returned NULL (check: logcat -s oxcheat linker)\n");
+                  else { printf("[+] injected\n"); ok = true; }
+              }
+              setSys(pid, savedSys); setRegs(pid, saved);
+              ptrace(PTRACE_DETACH, pid, 0, 0);
+              return ok;
+          }
+
+          // ── shared memory reader ──────────────────────────────────────────────────
+          static const Shm* g_shm = nullptr;
+          static Ent  g_ents[off::MAX_ENT];
+          static int  g_cnt = 0, g_sw = 0, g_sh = 0;
+
+          static uint64_t nowMs() {
+              timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+          }
+          static void shmTryOpen() {
+              int fd = open(off::SHM_PATH, O_RDONLY); if (fd < 0) return;
+              struct stat st{};
+              if (fstat(fd, &st) != 0 || (size_t)st.st_size < sizeof(Shm)) { close(fd); return; }   // payload hasn't sized it yet (SIGBUS guard)
+              void* p = mmap(nullptr, sizeof(Shm), PROT_READ, MAP_SHARED, fd, 0);
+              close(fd);
+              if (p != MAP_FAILED) g_shm = (const Shm*)p;
+          }
+          static void shmPoll() {
+              g_cnt = 0;
+              if (!g_shm) return;
+              for (int t = 0; t < 4; t++) {
+                  uint32_t a = g_shm->seq; if (a & 1) continue;
+                  __sync_synchronize();
+                  int cnt = g_shm->cnt, sw = g_shm->sw, sh = g_shm->sh; uint64_t ts = g_shm->ts_ms;
+                  if (cnt < 0) cnt = 0;
+                  if (cnt > off::MAX_ENT) cnt = off::MAX_ENT;
+                  memcpy(g_ents, g_shm->e, (size_t)cnt * sizeof(Ent));
+                  __sync_synchronize();
+                  if (g_shm->seq != a) continue;
+                  if (nowMs() - ts > 1000) cnt = 0;   // collector dead / game paused
+                  g_cnt = cnt; g_sw = sw; g_sh = sh;
+                  return;
+              }
+          }
+
+          // ── config ────────────────────────────────────────────────────────────────
+          struct Cfg {
+              bool  esp = true, box = true, hp = true, dist = true, skeleton = false, lines = false, team = false;
+              float maxDist = 300.f, headH = off::HEAD_H, lineWidth = 2.f;
+              float colEnemy[3] = {1.f, 0.2f, 0.f};
+              float colTeam [3] = {0.2f, 1.f, 0.4f};
+              float menuOpacity = 0.92f;
+          } g_cfg;
+
+          static void cfgSave() {
+              FILE* f = fopen(off::CFG_PATH, "w"); if (!f) return;
+              fprintf(f, "{\"esp\":%d,\"box\":%d,\"hp\":%d,\"dist\":%d,\"skeleton\":%d,"
+                         "\"lines\":%d,\"team\":%d,\"maxDist\":%.0f,\"headH\":%.2f,"
+                         "\"lw\":%.1f,\"opacity\":%.2f}\n",
+                  g_cfg.esp, g_cfg.box, g_cfg.hp, g_cfg.dist, g_cfg.skeleton,
+                  g_cfg.lines, g_cfg.team, (double)g_cfg.maxDist, (double)g_cfg.headH,
+                  (double)g_cfg.lineWidth, (double)g_cfg.menuOpacity);
+              fclose(f);
+          }
+          static void cfgLoad() {
+              FILE* f = fopen(off::CFG_PATH, "r"); if (!f) return;
+              char buf[512] = {}; fread(buf, 1, sizeof(buf) - 1, f); fclose(f);
+              auto jd = [&](const char* k, double& v) -> bool {
+                  char kk[32]; snprintf(kk, sizeof(kk), "\"%s\":", k);
+                  const char* p = strstr(buf, kk); if (!p) return false;
+                  v = strtod(p + strlen(kk), nullptr); return true;
+              };
+              double v;
+              if (jd("esp", v))      g_cfg.esp = v != 0;
+              if (jd("box", v))      g_cfg.box = v != 0;
+              if (jd("hp", v))       g_cfg.hp = v != 0;
+              if (jd("dist", v))     g_cfg.dist = v != 0;
+              if (jd("skeleton", v)) g_cfg.skeleton = v != 0;
+              if (jd("lines", v))    g_cfg.lines = v != 0;
+              if (jd("team", v))     g_cfg.team = v != 0;
+              if (jd("maxDist", v))  g_cfg.maxDist = (float)v;
+              if (jd("headH", v))    g_cfg.headH = (float)v;
+              if (jd("lw", v))       g_cfg.lineWidth = (float)v;
+              if (jd("opacity", v))  g_cfg.menuOpacity = (float)v;
+          }
+
+          // ── EGL / ImGui ───────────────────────────────────────────────────────────
+          static EGLDisplay g_dpy = EGL_NO_DISPLAY;
+          static EGLSurface g_sur = EGL_NO_SURFACE;
+          static EGLContext g_ctx = EGL_NO_CONTEXT;
+          static ANativeWindow* g_win = nullptr;
+          static int  g_dw = 0, g_dh = 0;        // window (square, long x long) — same trick as enenH/AndroidImgui, covers both rotations
+          static int  g_scrW = 0, g_scrH = 0;    // visible landscape area: long x short
+          static bool g_menuOpen = true;
+          static volatile bool g_run = true;
+          // writes where it died (module+offset) to stderr -> ends up in oxcheat.log; debuggerd still gets the re-raised signal
+          static void crashWhere(uintptr_t a, const char* tag) {
+              FILE* f = fopen("/proc/self/maps", "r"); if (!f) return;
+              char line[512];
+              while (fgets(line, sizeof(line), f)) {
+                  unsigned long lo, hi, off;
+                  if (sscanf(line, "%lx-%lx %*s %lx", &lo, &hi, &off) == 3 && a >= lo && a < hi) {
+                      const char* name = "[anon]"; char* p = strchr(line, '/');
+                      if (p) { p[strcspn(p, "\n")] = 0; name = p; }
+                      fprintf(stderr, "[!] %s %#lx = %s+%#lx\n", tag, (unsigned long)a, name, (unsigned long)(a - lo + off));
+                      break;
+                  }
+              }
+              fclose(f);
+          }
+          static void crashHandler(int sig, siginfo_t* si, void* ucv) {
+              ucontext_t* uc = (ucontext_t*)ucv;
+              fprintf(stderr, "\n[!] CRASH sig=%d fault_addr=%p\n", sig, si ? si->si_addr : nullptr);
+              crashWhere((uintptr_t)uc->uc_mcontext.pc, "pc");
+              crashWhere((uintptr_t)uc->uc_mcontext.regs[30], "lr");
+              fflush(stderr);                      // SA_RESETHAND: returning re-faults into the default action
+          }
+          static void onSig(int) { g_run = false; }
+
+          static bool initEGL() {
+              printf("[*] stage: GetDisplayInfo\n");
+              auto di = anwc::ANativeWindowCreator::GetDisplayInfo();
+              printf("[*] stage: display %dx%d rot %d\n", (int)di.width, (int)di.height, (int)di.orientation);
+              int W = di.width, H = di.height;
+              if (W <= 0 || H <= 0) { fprintf(stderr, "[-] GetDisplayInfo failed (libgui symbols for this Android version?)\n"); return false; }
+              if (H > W) std::swap(W, H);
+              g_scrW = W; g_scrH = H; g_dw = W; g_dh = W;
+              printf("[*] stage: create surface %dx%d\n", g_dw, g_dh);
+              g_win = anwc::ANativeWindowCreator::Create("oxcheat", g_dw, g_dh, false);
+              printf("[*] stage: surface %p\n", (void*)g_win);
+              if (!g_win) { fprintf(stderr, "[-] surface create failed\n"); return false; }
+
+              printf("[*] stage: egl\n");
+              g_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              eglInitialize(g_dpy, nullptr, nullptr);
+              const EGLint attr[] = {EGL_BLUE_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_RED_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 16,
+                                     EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_NONE};
+              EGLConfig cfg; EGLint n = 0;
+              if (!eglChooseConfig(g_dpy, attr, &cfg, 1, &n) || !n) { fprintf(stderr, "[-] eglChooseConfig\n"); return false; }
+              EGLint fmt = 0; eglGetConfigAttrib(g_dpy, cfg, EGL_NATIVE_VISUAL_ID, &fmt);
+              ANativeWindow_setBuffersGeometry(g_win, 0, 0, fmt);
+              const EGLint ca[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+              g_ctx = eglCreateContext(g_dpy, cfg, EGL_NO_CONTEXT, ca);
+              g_sur = eglCreateWindowSurface(g_dpy, cfg, g_win, nullptr);
+              if (!eglMakeCurrent(g_dpy, g_sur, g_sur, g_ctx)) { fprintf(stderr, "[-] eglMakeCurrent\n"); return false; }
+              eglSwapInterval(g_dpy, 1);
+              printf("[+] overlay %dx%d (screen %dx%d)\n", g_dw, g_dh, g_scrW, g_scrH);
+              return true;
+          }
+
+          static void loadFont(float px) {
+              ImGuiIO& io = ImGui::GetIO();
+              const char* fonts[] = {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/NotoSans-Regular.ttf",
+                                     "/system/fonts/DroidSans.ttf", "/system/fonts/NotoSansCJK-Regular.ttc"};
+              for (const char* f : fonts)
+                  if (access(f, R_OK) == 0 && io.Fonts->AddFontFromFileTTF(f, px)) return;
+              ImGui::GetStyle().FontSizeBase = px;   // fallback: scale built-in font (imgui >= 1.92)
+          }
+
+          static bool initImGui() {
+              IMGUI_CHECKVERSION();
+              ImGui::CreateContext();
+              ImGui::GetIO().IniFilename = nullptr;
+              ImGui::StyleColorsDark();
+              auto& s = ImGui::GetStyle();
+              s.WindowRounding = 12; s.FrameRounding = 8; s.GrabRounding = 8;
+              s.WindowPadding = {16, 16}; s.FramePadding = {12, 8};
+              s.Colors[ImGuiCol_TitleBgActive] = {0.14f, 0.14f, 0.18f, 1.f};
+              s.Colors[ImGuiCol_CheckMark]     = {0.40f, 0.90f, 0.55f, 1.f};
+              s.Colors[ImGuiCol_SliderGrab]    = {0.40f, 0.90f, 0.55f, 1.f};
+              s.Colors[ImGuiCol_Tab]           = {0.18f, 0.18f, 0.22f, 1.f};
+              s.Colors[ImGuiCol_TabActive]     = {0.28f, 0.28f, 0.36f, 1.f};
+              loadFont(26.f);
+              ImGui_ImplAndroid_Init(g_win);
+              ImGui_ImplOpenGL3_Init("#version 300 es");
+              return true;
+          }
+
+          // ── menu ──────────────────────────────────────────────────────────────────
+          static void drawMenu() {
+              ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = {0.10f, 0.10f, 0.13f, g_cfg.menuOpacity};
+
+              ImGui::SetNextWindowPos({8, 8});
+              ImGui::Begin("##tog", nullptr,
+                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize |
+                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
+              if (ImGui::Button(g_menuOpen ? "[X]" : "[M]")) g_menuOpen = !g_menuOpen;
+              ImGui::End();
+              if (!g_menuOpen) return;
+
+              ImGui::SetNextWindowPos({(float)g_scrW * 0.5f, (float)g_scrH * 0.5f}, ImGuiCond_FirstUseEver, {0.5f, 0.5f});
+              ImGui::SetNextWindowSize({760, 520}, ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowSizeConstraints({420, 300}, {(float)g_scrW, (float)g_scrH});
+              ImGui::Begin("OxCheat", nullptr, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoNav);   // drag by title
+
+              if (ImGui::BeginTabBar("tabs")) {
+                  if (ImGui::BeginTabItem("ESP")) {
+                      ImGui::Checkbox("ESP", &g_cfg.esp);
+                      ImGui::SameLine(); ImGui::Checkbox("Box", &g_cfg.box);
+                      ImGui::SameLine(); ImGui::Checkbox("HP", &g_cfg.hp);
+                      ImGui::Checkbox("Distance", &g_cfg.dist);
+                      ImGui::SameLine(); ImGui::Checkbox("Skeleton", &g_cfg.skeleton);
+                      ImGui::SameLine(); ImGui::Checkbox("Lines", &g_cfg.lines);
+                      ImGui::Checkbox("Show teammates", &g_cfg.team);
+                      ImGui::SetNextItemWidth(-1);
+                      ImGui::SliderFloat("##md", &g_cfg.maxDist, 25.f, 600.f, "max dist %.0f m");
+                      ImGui::SetNextItemWidth(-1);
+                      ImGui::SliderFloat("##hh", &g_cfg.headH, 1.0f, 2.6f, "box height %.2f m");
+                      ImGui::SetNextItemWidth(-1);
+                      ImGui::SliderFloat("##lw", &g_cfg.lineWidth, 1.f, 5.f, "line width %.1f");
+                      ImGui::ColorEdit3("Enemy", &g_cfg.colEnemy[0]);
+                      ImGui::ColorEdit3("Team", &g_cfg.colTeam[0]);
+                      ImGui::EndTabItem();
+                  }
+                  if (ImGui::BeginTabItem("Config")) {
+                      ImGui::SetNextItemWidth(-1);
+                      ImGui::SliderFloat("##op", &g_cfg.menuOpacity, 0.3f, 1.f, "opacity %.2f");
+                      float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                      if (ImGui::Button("Save", {half, 0})) cfgSave();
+                      ImGui::SameLine();
+                      if (ImGui::Button("Load", {half, 0})) cfgLoad();
+                      ImGui::Spacing();
+                      ImGui::TextColored({0.5f, 0.5f, 0.5f, 1.f}, "cfg: %s", off::CFG_PATH);
+                      if (g_cnt > 0) ImGui::TextColored({0.4f, 1.f, 0.5f, 1.f}, "entities: %d  game: %dx%d", g_cnt, g_sw, g_sh);
+                      else           ImGui::TextColored({1.f, 0.7f, 0.3f, 1.f}, "waiting for game data...");
+                      ImGui::EndTabItem();
+                  }
+                  ImGui::EndTabBar();
+              }
+              ImGui::End();
+          }
+
+          // ── ESP ───────────────────────────────────────────────────────────────────
+          static void drawEsp() {
+              if (!g_cfg.esp || g_cnt <= 0 || g_sw <= 0 || g_sh <= 0) return;
+              // game px (Unity, bottom-left origin) -> overlay px (ImGui, top-left): y flipped, scaled to the visible landscape area
+              float kx = (float)g_scrW / (float)g_sw, ky = (float)g_scrH / (float)g_sh;
+              float hs = g_cfg.headH / off::HEAD_H;   // box-height slider rescales collector's head point
+              ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+              for (int i = 0; i < g_cnt; i++) {
+                  Ent& e = g_ents[i];
+                  if (!e.alive || e.dist > g_cfg.maxDist) continue;
+                  if (e.team && !g_cfg.team) continue;
+
+                  float fx = e.fx * kx, fy = ((float)g_sh - e.fy) * ky;
+                  float hx = e.hx * kx, hy0 = ((float)g_sh - e.hy) * ky;
+                  float hy = fy - (fy - hy0) * hs;
+                  float h = fy - hy; if (h < 4.f) continue;
+                  float w = h * 0.45f, cx = (fx + hx) * 0.5f;
+                  float x0 = cx - w * 0.5f, x1 = cx + w * 0.5f;
+
+                  float* c = e.team ? g_cfg.colTeam : g_cfg.colEnemy;
+                  ImU32 col = IM_COL32((int)(c[0] * 255), (int)(c[1] * 255), (int)(c[2] * 255), 255);
+                  ImU32 blk = IM_COL32(0, 0, 0, 200);
+                  float lw = g_cfg.lineWidth;
+
+                  if (g_cfg.lines) dl->AddLine({(float)g_scrW * 0.5f, (float)g_scrH}, {fx, fy}, col, 1.5f);
+                  if (g_cfg.box) {
+                      dl->AddRect({x0 - 1, hy - 1}, {x1 + 1, fy + 1}, blk, 0, 0, lw + 2);
+                      dl->AddRect({x0, hy}, {x1, fy}, col, 0, 0, lw);
+                  }
+                  if (g_cfg.hp && e.hpMax > 1.f) {
+                      float f = e.hp / e.hpMax; f = f < 0 ? 0 : (f > 1 ? 1 : f);
+                      dl->AddRectFilled({x0 - 9, hy - 1}, {x0 - 4, fy + 1}, blk);
+                      dl->AddRectFilled({x0 - 8, fy - h * f}, {x0 - 5, fy}, IM_COL32((int)(255 * (1 - f)), (int)(255 * f), 0, 255));
+                  }
+                  if (g_cfg.dist) {
+                      char t[24]; snprintf(t, sizeof(t), "%dm", (int)e.dist);
+                      float fs = ImGui::GetFontSize() * 0.7f;
+                      ImVec2 sz = ImGui::GetFont()->CalcTextSizeA(fs, 1e9f, 0.f, t);
+                      dl->AddText(ImGui::GetFont(), fs, {cx - sz.x * 0.5f, fy + 3}, IM_COL32_WHITE, t);
+                  }
+              }
+          }
+
+          static int runOverlay() {
+              if (!initEGL()) return 1;
+              printf("[*] stage: imgui\n");
+              initImGui();
+              printf("[*] stage: touch\n");
+              cfgLoad();
+              Touch_Init(g_scrW, g_scrH, 0, true);
+              printf("[+] overlay up. tap [M] in the top-left corner. Ctrl-C to quit.\n");
+
+              uint64_t lastOpen = 0;
+              while (g_run) {
+                  if (!g_shm && nowMs() - lastOpen > 1000) { lastOpen = nowMs(); shmTryOpen(); }
+                  shmPoll();
+                  Touch_UpdateImGui();
+
+                  ImGui_ImplOpenGL3_NewFrame();
+                  ImGui_ImplAndroid_NewFrame();
+                  ImGui::NewFrame();
+                  drawEsp();
+                  drawMenu();
+                  ImGui::Render();
+
+                  glViewport(0, 0, g_dw, g_dh);
+                  glClearColor(0, 0, 0, 0);
+                  glClear(GL_COLOR_BUFFER_BIT);
+                  ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+                  eglSwapBuffers(g_dpy, g_sur);
+              }
+
+              ImGui_ImplOpenGL3_Shutdown();
+              ImGui_ImplAndroid_Shutdown();
+              ImGui::DestroyContext();
+              eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+              eglDestroyContext(g_dpy, g_ctx);
+              eglDestroySurface(g_dpy, g_sur);
+              eglTerminate(g_dpy);
+              anwc::ANativeWindowCreator::Destroy(g_win);
+              Touch_Close();
+              return 0;
+          }
+
+          // usage: oxcheat [libcheat.so path]   |   oxcheat --overlay   (skip injection)
+          int main(int argc, char** argv) {
+              if (geteuid() != 0) { fprintf(stderr, "need root\n"); return 1; }
+              signal(SIGINT, onSig); signal(SIGTERM, onSig);
+              { struct sigaction sa{}; sa.sa_sigaction = crashHandler; sa.sa_flags = SA_SIGINFO | SA_RESETHAND; sigemptyset(&sa.sa_mask);
+                for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGFPE}) sigaction(s, &sa, nullptr); }
+              setvbuf(stdout, nullptr, _IONBF, 0);
+
+              bool overlayOnly = argc > 1 && !strcmp(argv[1], "--overlay");
+              if (!overlayOnly) {
+                  char lib[512];
+                  if (argc > 1) snprintf(lib, sizeof(lib), "%s", argv[1]);
+                  else {
+                      char self[512] = {};
+                      ssize_t r = readlink("/proc/self/exe", self, sizeof(self) - 1);
+                      if (r <= 0) { perror("readlink"); return 1; }
+                      char* sl = strrchr(self, '/');
+                      if (sl) { *sl = 0; snprintf(lib, sizeof(lib), "%s/libcheat.so", self); }
+                      else snprintf(lib, sizeof(lib), "./libcheat.so");
+                  }
+                  if (!injectLib(lib)) return 1;
+              }
+              return runOverlay();
+          }
+
+          #endif // PAYLOAD
+          OXEOF
+          wc -l cheat.cpp
+      - name: build (Android NDK on the runner, arm64)
+        run: |
+          set -e
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-$ANDROID_NDK}}"
+          echo "NDK=$NDK"
+          BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
+          CXX=$BIN/aarch64-linux-android24-clang++
+          I=$PWD/include
+          $CXX -shared -fPIC -O2 -std=c++20 -fvisibility=hidden -DPAYLOAD -fno-exceptions -fno-rtti -nostdlib++ \
+              cheat.cpp -ldl -llog -lm -Wl,--no-undefined -o libcheat.so
+          CPPS="$I/ImGui/imgui.cpp $I/ImGui/imgui_draw.cpp $I/ImGui/imgui_widgets.cpp $I/ImGui/imgui_tables.cpp \
+                $I/ImGui/backends/imgui_impl_android.cpp $I/ImGui/backends/imgui_impl_opengl3.cpp $I/Android_touch/TouchHelperA.cpp"
+          $CXX -O2 -std=c++20 -DHOST -static-libstdc++ -I$I -I$I/ImGui -I$I/native_surface -I$I/Android_touch \
+              cheat.cpp $CPPS -llog -ldl -landroid -lEGL -lGLESv3 -o oxcheat
+          $BIN/llvm-strip libcheat.so oxcheat
+          echo "--- libcheat.so NEEDED (must not contain libc++):"; readelf -d libcheat.so | grep NEEDED
+          ! readelf -d libcheat.so | grep -q 'c++'
+          echo "--- oxcheat NEEDED:"; readelf -d oxcheat | grep NEEDED
+          ls -l libcheat.so oxcheat
+      - name: pack single file
+        run: |
+          set -e
+          mkdir -p out
+          cat > out/oxcheat_run.sh <<'OXEOF'
+          #!/system/bin/sh
+          # oxcheat_run.sh — готовый билд внутри, Termux/clang НЕ нужны. Только root.
+          #   sh /data/local/tmp/oxcheat_run.sh        распаковать, запустить игру, инжект + оверлей (Ctrl-C = выход)
+          #   sh /data/local/tmp/oxcheat_run.sh bg     то же, оверлей в фоне (лог: /data/local/tmp/oxcheat.log)
+          #   sh /data/local/tmp/oxcheat_run.sh stop
+          SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+          [ "$(id -u)" != "0" ] && exec su -c "sh '$SELF' $*"
+
+          DIR=/data/local/tmp
+          PKG="com.catsbit.oxidesurvivalisland"
+          R='\033[31m' G='\033[32m' C='\033[36m' W='\033[0m'
+          die(){ printf "${R}[-] %s${W}\n" "$1"; exit 1; }
+          ok(){  printf "${G}[+] %s${W}\n" "$1"; }
+          inf(){ printf "${C}[*] %s${W}\n" "$1"; }
+
+          [ "$1" = "stop" ] && { for p in $(pidof oxcheat); do kill "$p"; done; ok "stopped"; exit 0; }
+
+          for p in $(pidof oxcheat); do kill "$p" 2>/dev/null; done; sleep 1
+          inf "распаковываю в $DIR ..."
+          sed '1,/^__PAYLOAD__$/d' "$SELF" | base64 -d | tar xf - -C "$DIR" || die "распаковка не удалась (скачай файл заново)"
+          chmod 755 "$DIR/oxcheat"; chmod 777 "$DIR/libcheat.so"
+
+          if [ -z "$(pidof "$PKG")" ]; then
+              inf "запускаю игру..."
+              monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1
+          fi
+          inf "ждём il2cpp, инжект, оверлей. меню: тап [M] слева сверху"
+          if [ "$1" = "bg" ]; then
+              nohup "$DIR/oxcheat" "$DIR/libcheat.so" >"$DIR/oxcheat.log" 2>&1 &
+              sleep 1; ok "в фоне. лог: $DIR/oxcheat.log   стоп: sh $SELF stop"; exit 0
+          fi
+          LOG=$DIR/oxcheat.log
+          {
+              echo "== $(date)  android $(getprop ro.build.version.release) sdk $(getprop ro.build.version.sdk) $(getprop ro.product.model) $(getprop ro.product.cpu.abi)"
+              "$DIR/oxcheat" "$DIR/libcheat.so"
+              RC=$?
+              echo "[exit code $RC]"
+              if [ "$RC" != 0 ]; then echo "--- logcat crash buffer:"; logcat -d -b crash 2>/dev/null | tail -60; fi
+              echo "--- logcat oxcheat (game side):"; logcat -d -s oxcheat 2>/dev/null | tail -40
+          } 2>&1 | tee -i "$LOG"
+          ok "лог: $LOG"
+          exit 0
+          __PAYLOAD__
+          OXEOF
+          tar cf - libcheat.so oxcheat | base64 -w 100 >> out/oxcheat_run.sh
+          cp libcheat.so oxcheat out/
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oxcheat
+          path: out/*
