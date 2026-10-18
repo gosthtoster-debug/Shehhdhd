@@ -23,7 +23,8 @@ jobs:
       - name: fetch sources into src/ (skipped if src/build.sh already exists)
         run: |
           set -e
-          if [ -f src/build.sh ]; then echo "src/ already present, skipping fetch"; exit 0; fi
+          REV=v12-license-post
+          if [ -f src/build.sh ] && [ "$(cat src/.cheat_rev 2>/dev/null)" = "$REV" ]; then echo "src/ already at $REV, skipping fetch"; exit 0; fi
           set -e
           git clone -q https://github.com/ocornut/imgui imgui && git -C imgui checkout -q c1aaac65e896a45f81f47a4d68f9959e0f86c859
           git clone -q https://github.com/enenH/AndroidImgui aimgui && git -C aimgui checkout -q 63c9d83620665f87dce26e0a6de9f209b6d69593
@@ -1999,16 +2000,14 @@ jobs:
           }
           
           // ── license check (HOST side only) ───────────────────────────────────────────
-          // GET https://license-validator.gosthtoster.workers.dev/check?key=<KEY> over TLS.
+          // POST https://license-validator.gosthtoster.workers.dev/  {"licenseKey":"<KEY>"} over TLS.
           // Uses Android's own libssl.so (BoringSSL, classic OpenSSL symbol names) via dlopen,
           // so no TLS lib needs to be linked or bundled. Needs libssl.so/libcrypto.so on-device
           // (stock on every Android) and internet access for the root shell.
           namespace lic {
               constexpr const char* SRV_HOST = "license-validator.gosthtoster.workers.dev";   // not HOST: clashes with NDK linux/input-event-codes.h
-              // worker only checks request.method === "POST" and reads JSON body { licenseKey }; path is never inspected, so "/" works.
-              constexpr const char* PATH     = "/";
-              constexpr const char* BODY_FMT = "{\"licenseKey\":\"%s\"}";
-              constexpr const char* KEY_PATH = "/data/local/tmp/.@fyxod_cpp_key";                // not KEY_FILE: clashes with the same header (KEY_FILE=144)
+              constexpr const char* PATH     = "/";                                           // worker does not route by path
+              constexpr const char* KEY_PATH = "/data/local/tmp/.@fyxod_cpp_key";             // not KEY_FILE: clashes with the same header (KEY_FILE=144)
           }
           
           static int tcpConnect(const char* host, int port) {
@@ -2027,15 +2026,11 @@ jobs:
               return fd;
           }
           
-          // classic OpenSSL symbol names, resolved by hand: BoringSSL on-device keeps them for NDK/system compat,
-          // same pattern this project already uses for libgui.so in ANativeWindowCreator.h.
-          static std::string g_licErr;   // last failure reason, survives -DNOLOG (unlike EPRINT) so the lock screen can show it
-
-          // worker requires POST + application/json body (see worker.js), a GET is rejected with 405 before it even
-          // looks at the key — that was the whole bug, this now sends a real POST with a Content-Length'd JSON body.
-          static bool httpsPost(const char* host, const char* path, const char* body, char* out, size_t outCap) {
+          // classic OpenSSL symbol names, resolved by hand from the device's libssl.so.
+          // reqBody == nullptr -> GET, otherwise POST with a JSON body.
+          static bool httpsRequest(const char* host, const char* path, const char* reqBody, char* out, size_t outCap) {
               void* libssl = dlopen("libssl.so", RTLD_NOW);
-              if (!libssl) { g_licErr = "libssl.so not found"; EPRINT("license: libssl.so not found\n"); return false; }
+              if (!libssl) { EPRINT("license: libssl.so not found\n"); return false; }
               auto TLS_client_method  = (void* (*)())dlsym(libssl, "TLS_client_method");
               auto SSL_CTX_new        = (void* (*)(void*))dlsym(libssl, "SSL_CTX_new");
               auto SSL_CTX_set_verify = (void  (*)(void*, int, void*))dlsym(libssl, "SSL_CTX_set_verify");
@@ -2048,34 +2043,47 @@ jobs:
               auto SSL_read           = (int   (*)(void*, void*, int))dlsym(libssl, "SSL_read");
               auto SSL_shutdown       = (int   (*)(void*))dlsym(libssl, "SSL_shutdown");
               auto SSL_free           = (void  (*)(void*))dlsym(libssl, "SSL_free");
-              if (!TLS_client_method || !SSL_CTX_new || !SSL_new || !SSL_set_fd || !SSL_ctrl || !SSL_connect || !SSL_write || !SSL_read) {
-                  g_licErr = "libssl symbol resolve failed (vendor BoringSSL layout differs)";
+              if (!TLS_client_method || !SSL_CTX_new || !SSL_CTX_free || !SSL_new || !SSL_set_fd || !SSL_ctrl ||
+                  !SSL_connect || !SSL_write || !SSL_read || !SSL_shutdown || !SSL_free) {
                   EPRINT("license: libssl symbol resolve failed (vendor BoringSSL layout differs)\n"); return false;
               }
-
+          
+              // build the request first: nothing is opened yet, so early-outs need no cleanup
+              char req[768];
+              int n;
+              if (reqBody)
+                  n = snprintf(req, sizeof(req),
+                               "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: @fyxod_cpp\r\n"
+                               "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+                               path, host, strlen(reqBody), reqBody);
+              else
+                  n = snprintf(req, sizeof(req),
+                               "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: @fyxod_cpp\r\n\r\n",
+                               path, host);
+              if (n <= 0 || n >= (int)sizeof(req)) { EPRINT("license: request too large\n"); return false; }
+          
               int fd = tcpConnect(host, 443);
-              if (fd < 0) { g_licErr = "tcp connect failed (no network / DNS?)"; EPRINT("license: tcp connect failed (no network?)\n"); return false; }
-
+              if (fd < 0) { EPRINT("license: tcp connect failed (no network?)\n"); return false; }
+          
               void* ctx = SSL_CTX_new(TLS_client_method());
-              if (SSL_CTX_set_verify) SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);   // no system CA lookup from a root shell
+              if (!ctx) { EPRINT("license: SSL_CTX_new failed\n"); close(fd); return false; }
+              // FILL(security): VERIFY_NONE means a MITM can answer {"valid":true}. Replace with CA verification
+              // or a signed response before shipping.
+              if (SSL_CTX_set_verify) SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);
               void* ssl = SSL_new(ctx);
+              if (!ssl) { EPRINT("license: SSL_new failed\n"); SSL_CTX_free(ctx); close(fd); return false; }
               SSL_set_fd(ssl, fd);
               SSL_ctrl(ssl, 55 /*SSL_CTRL_SET_TLSEXT_HOSTNAME*/, 0 /*TLSEXT_NAMETYPE_host_name*/, (void*)host);  // SNI, Cloudflare routes on it
               if (SSL_connect(ssl) != 1) {
-                  g_licErr = "TLS handshake failed";
                   EPRINT("license: TLS handshake failed\n");
                   SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false;
               }
           
-              char req[768];
-              size_t blen = strlen(body);
-              int n = snprintf(req, sizeof(req),
-                  "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: @fyxod_cpp\r\n"
-                  "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
-                  path, host, blen, body);
-              int off = 0;
-              while (off < n) { int w = SSL_write(ssl, req + off, n - off); if (w <= 0) { g_licErr = "SSL_write failed"; SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false; } off += w; }
-
+              if (SSL_write(ssl, req, n) != n) {
+                  EPRINT("license: request write failed\n");
+                  SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false;
+              }
+          
               size_t total = 0;
               while (total + 1 < outCap) {
                   int r = SSL_read(ssl, out + total, (int)(outCap - 1 - total));
@@ -2088,25 +2096,26 @@ jobs:
           }
           
           static bool licenseCheck(const char* key) {
-              if (!key || !key[0]) { g_licErr = "empty key"; return false; }
-              char body[192]; snprintf(body, sizeof(body), lic::BODY_FMT, key);   // keyboard charset (alnum - _ @ . space) is JSON-safe, no escaping needed
+              if (!key || !key[0]) return false;
+              // the key is spliced into JSON by hand: reject anything that would break the string
+              for (const char* p = key; *p; ++p)
+                  if ((unsigned char)*p < 0x20 || *p == '"' || *p == '\\') { EPRINT("license: bad character in key\n"); return false; }
+          
+              char reqBody[256];
+              int bn = snprintf(reqBody, sizeof(reqBody), "{\"licenseKey\":\"%s\"}", key);
+              if (bn <= 0 || bn >= (int)sizeof(reqBody)) { EPRINT("license: key too long\n"); return false; }
+          
               char resp[4096];
-              if (!httpsPost(lic::SRV_HOST, lic::PATH, body, resp, sizeof(resp))) return false;   // g_licErr already set by httpsPost
-              char status[16] = {}; memcpy(status, resp, 15);
-              char* rbody = strstr(resp, "\r\n\r\n"); rbody = rbody ? rbody + 4 : resp;
-              // worker.js: 200 = valid, 403 = invalid/expired (still a real JSON body, not an HTTP error to bail out on),
-              // 400 = malformed request, 405 = wrong method, 500 = server-side exception. only treat non-40x as a hard transport failure.
-              bool gotJson = !strncmp(resp, "HTTP/1.1 2", 10) || !strncmp(resp, "HTTP/1.0 2", 10)
-                          || !strncmp(resp, "HTTP/1.1 4", 10) || !strncmp(resp, "HTTP/1.0 4", 10);
-              if (!gotJson) {
-                  g_licErr = "server status: " + std::string(status);                 // e.g. 5xx = worker down/crashing
-                  EPRINT("license: bad status %.15s, body: %.80s\n", resp, rbody);
-                  return false;
-              }
-              bool valid = strstr(rbody, "\"valid\":true") != nullptr;
-              if (!valid) { g_licErr = "server said: " + std::string(rbody).substr(0, 80); EPRINT("license: rejected (%.80s)\n", rbody); }
+              if (!httpsRequest(lic::SRV_HOST, lic::PATH, reqBody, resp, sizeof(resp))) { EPRINT("license: request failed\n"); return false; }
+          
+              bool httpOk = !strncmp(resp, "HTTP/1.1 2", 10) || !strncmp(resp, "HTTP/1.0 2", 10);
+              char* body = strstr(resp, "\r\n\r\n"); body = body ? body + 4 : resp;
+              // worker answers JSON.stringify({valid:true,...}) -> compact, no spaces
+              bool valid = httpOk && strstr(body, "\"valid\":true") != nullptr;
+              if (!valid) EPRINT("license: rejected (%.80s)\n", body);
               return valid;
           }
+          
           static void loadSavedKey(char* out, size_t cap) {
               out[0] = 0;
               FILE* f = fopen(lic::KEY_PATH, "r"); if (!f) return;
@@ -2165,7 +2174,7 @@ jobs:
               if (!g_licStatus.empty()) ImGui::TextColored({1.f, 0.4f, 0.4f, 1.f}, "%s", g_licStatus.c_str());
               if (click && g_keyBuf[0]) {
                   if (licenseCheck(g_keyBuf)) { saveKey(g_keyBuf); g_licensed = true; g_licStatus.clear(); }
-                  else g_licStatus = g_licErr.empty() ? "invalid key" : g_licErr;   // real failure reason, not a generic label
+                  else g_licStatus = "invalid key";
               }
               ImGui::End();
           }
@@ -2255,7 +2264,8 @@ jobs:
           #endif // PAYLOAD
           OXEOF
           wc -l cheat.cpp
-          mkdir -p src && mv include cheat.cpp src/ && rm -rf imgui aimgui
+          rm -rf src && mkdir -p src && mv include cheat.cpp src/ && rm -rf imgui aimgui
+          echo "$REV" > src/.cheat_rev
           cat > src/build.sh <<'BSEOF'
           #!/usr/bin/env bash
           # build.sh: собирает @fyxod_cpp из этого каталога. Нужен только Android NDK (r26+), интернет НЕ нужен.
@@ -2370,8 +2380,10 @@ jobs:
             git push
           fi
       - name: build (Android NDK on the runner, arm64)
+        env:
+          RELEASE: ${{ inputs.release }}
         run: |
-          RELEASE="${{ inputs.release }}" bash src/build.sh
+          bash src/build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: "@fyxod_cpp"
