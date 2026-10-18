@@ -2005,7 +2005,9 @@ jobs:
           // (stock on every Android) and internet access for the root shell.
           namespace lic {
               constexpr const char* SRV_HOST = "license-validator.gosthtoster.workers.dev";   // not HOST: clashes with NDK linux/input-event-codes.h
-              constexpr const char* PATH_FMT = "/check?key=%s";          // FILL: confirm path against the real worker route
+              // worker only checks request.method === "POST" and reads JSON body { licenseKey }; path is never inspected, so "/" works.
+              constexpr const char* PATH     = "/";
+              constexpr const char* BODY_FMT = "{\"licenseKey\":\"%s\"}";
               constexpr const char* KEY_PATH = "/data/local/tmp/.@fyxod_cpp_key";                // not KEY_FILE: clashes with the same header (KEY_FILE=144)
           }
           
@@ -2027,9 +2029,13 @@ jobs:
           
           // classic OpenSSL symbol names, resolved by hand: BoringSSL on-device keeps them for NDK/system compat,
           // same pattern this project already uses for libgui.so in ANativeWindowCreator.h.
-          static bool httpsGet(const char* host, const char* path, char* out, size_t outCap) {
+          static std::string g_licErr;   // last failure reason, survives -DNOLOG (unlike EPRINT) so the lock screen can show it
+
+          // worker requires POST + application/json body (see worker.js), a GET is rejected with 405 before it even
+          // looks at the key — that was the whole bug, this now sends a real POST with a Content-Length'd JSON body.
+          static bool httpsPost(const char* host, const char* path, const char* body, char* out, size_t outCap) {
               void* libssl = dlopen("libssl.so", RTLD_NOW);
-              if (!libssl) { EPRINT("license: libssl.so not found\n"); return false; }
+              if (!libssl) { g_licErr = "libssl.so not found"; EPRINT("license: libssl.so not found\n"); return false; }
               auto TLS_client_method  = (void* (*)())dlsym(libssl, "TLS_client_method");
               auto SSL_CTX_new        = (void* (*)(void*))dlsym(libssl, "SSL_CTX_new");
               auto SSL_CTX_set_verify = (void  (*)(void*, int, void*))dlsym(libssl, "SSL_CTX_set_verify");
@@ -2043,26 +2049,33 @@ jobs:
               auto SSL_shutdown       = (int   (*)(void*))dlsym(libssl, "SSL_shutdown");
               auto SSL_free           = (void  (*)(void*))dlsym(libssl, "SSL_free");
               if (!TLS_client_method || !SSL_CTX_new || !SSL_new || !SSL_set_fd || !SSL_ctrl || !SSL_connect || !SSL_write || !SSL_read) {
+                  g_licErr = "libssl symbol resolve failed (vendor BoringSSL layout differs)";
                   EPRINT("license: libssl symbol resolve failed (vendor BoringSSL layout differs)\n"); return false;
               }
-          
+
               int fd = tcpConnect(host, 443);
-              if (fd < 0) { EPRINT("license: tcp connect failed (no network?)\n"); return false; }
-          
+              if (fd < 0) { g_licErr = "tcp connect failed (no network / DNS?)"; EPRINT("license: tcp connect failed (no network?)\n"); return false; }
+
               void* ctx = SSL_CTX_new(TLS_client_method());
               if (SSL_CTX_set_verify) SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);   // no system CA lookup from a root shell
               void* ssl = SSL_new(ctx);
               SSL_set_fd(ssl, fd);
               SSL_ctrl(ssl, 55 /*SSL_CTRL_SET_TLSEXT_HOSTNAME*/, 0 /*TLSEXT_NAMETYPE_host_name*/, (void*)host);  // SNI, Cloudflare routes on it
               if (SSL_connect(ssl) != 1) {
+                  g_licErr = "TLS handshake failed";
                   EPRINT("license: TLS handshake failed\n");
                   SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false;
               }
           
-              char req[512];
-              int n = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: @fyxod_cpp\r\n\r\n", path, host);
-              SSL_write(ssl, req, n);
-          
+              char req[768];
+              size_t blen = strlen(body);
+              int n = snprintf(req, sizeof(req),
+                  "POST %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: @fyxod_cpp\r\n"
+                  "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+                  path, host, blen, body);
+              int off = 0;
+              while (off < n) { int w = SSL_write(ssl, req + off, n - off); if (w <= 0) { g_licErr = "SSL_write failed"; SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false; } off += w; }
+
               size_t total = 0;
               while (total + 1 < outCap) {
                   int r = SSL_read(ssl, out + total, (int)(outCap - 1 - total));
@@ -2075,15 +2088,23 @@ jobs:
           }
           
           static bool licenseCheck(const char* key) {
-              if (!key || !key[0]) return false;
-              char path[256]; snprintf(path, sizeof(path), lic::PATH_FMT, key);
+              if (!key || !key[0]) { g_licErr = "empty key"; return false; }
+              char body[192]; snprintf(body, sizeof(body), lic::BODY_FMT, key);   // keyboard charset (alnum - _ @ . space) is JSON-safe, no escaping needed
               char resp[4096];
-              if (!httpsGet(lic::SRV_HOST, path, resp, sizeof(resp))) { EPRINT("license: request failed\n"); return false; }
-              bool httpOk = !strncmp(resp, "HTTP/1.1 2", 10) || !strncmp(resp, "HTTP/1.0 2", 10);
-              char* body = strstr(resp, "\r\n\r\n"); body = body ? body + 4 : resp;
-              // FILL: body contract assumed as {"valid":true,...} — adjust the needle below to match the real worker response
-              bool valid = httpOk && strstr(body, "\"valid\":true") != nullptr;
-              if (!valid) EPRINT("license: rejected (%.80s)\n", body);
+              if (!httpsPost(lic::SRV_HOST, lic::PATH, body, resp, sizeof(resp))) return false;   // g_licErr already set by httpsPost
+              char status[16] = {}; memcpy(status, resp, 15);
+              char* rbody = strstr(resp, "\r\n\r\n"); rbody = rbody ? rbody + 4 : resp;
+              // worker.js: 200 = valid, 403 = invalid/expired (still a real JSON body, not an HTTP error to bail out on),
+              // 400 = malformed request, 405 = wrong method, 500 = server-side exception. only treat non-40x as a hard transport failure.
+              bool gotJson = !strncmp(resp, "HTTP/1.1 2", 10) || !strncmp(resp, "HTTP/1.0 2", 10)
+                          || !strncmp(resp, "HTTP/1.1 4", 10) || !strncmp(resp, "HTTP/1.0 4", 10);
+              if (!gotJson) {
+                  g_licErr = "server status: " + std::string(status);                 // e.g. 5xx = worker down/crashing
+                  EPRINT("license: bad status %.15s, body: %.80s\n", resp, rbody);
+                  return false;
+              }
+              bool valid = strstr(rbody, "\"valid\":true") != nullptr;
+              if (!valid) { g_licErr = "server said: " + std::string(rbody).substr(0, 80); EPRINT("license: rejected (%.80s)\n", rbody); }
               return valid;
           }
           static void loadSavedKey(char* out, size_t cap) {
@@ -2105,23 +2126,50 @@ jobs:
           static bool        g_licensed    = false;
           static std::string g_licStatus;
           
+          // no Android IME exists for a root overlay (no Activity, no InputMethodManager), so the keyboard is drawn in ImGui itself
+          static bool g_kbShift = false;
+          static void kbAppend(const char* t) {
+              size_t n = strlen(g_keyBuf), m = strlen(t);
+              if (n + m < sizeof(g_keyBuf)) memcpy(g_keyBuf + n, t, m + 1);
+          }
           static void drawLockScreen() {
+              float w = (float)g_scrW * 0.92f; if (w > 980.f) w = 980.f;
               ImGui::SetNextWindowPos({(float)g_scrW * 0.5f, (float)g_scrH * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
-              ImGui::SetNextWindowSize({420.f, 0.f}, ImGuiCond_Always);
+              ImGui::SetNextWindowSize({w, 0.f}, ImGuiCond_Always);
               ImGui::Begin("License", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
               ImGui::TextWrapped("Enter your license key");
               ImGui::SetNextItemWidth(-1.f);
-              ImGui::SetKeyboardFocusHere();
-              bool enter = ImGui::InputText("##key", g_keyBuf, sizeof(g_keyBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_Password);
-              bool click = ImGui::Button("Unlock", {-1.f, 0.f});
+              ImGui::InputText("##key", g_keyBuf, sizeof(g_keyBuf), ImGuiInputTextFlags_ReadOnly);   // shows what was tapped
+              static const char* rows[4] = {"1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm_@."};
+              float sp = ImGui::GetStyle().ItemSpacing.x;
+              float bw = (ImGui::GetContentRegionAvail().x - sp * 9.f) / 10.f, bh = bw * 0.95f;
+              for (int r = 0; r < 4; r++) {
+                  for (int i = 0; rows[r][i]; i++) {
+                      char ch = rows[r][i];
+                      if (g_kbShift && ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+                      char lab[2] = {ch, 0};
+                      ImGui::PushID(r * 16 + i);
+                      if (ImGui::Button(lab, {bw, bh})) { kbAppend(lab); g_kbShift = false; }
+                      ImGui::PopID();
+                      if (rows[r][i + 1]) ImGui::SameLine();
+                  }
+              }
+              if (ImGui::Button(g_kbShift ? "SHIFT" : "shift", {bw * 2.f + sp, bh})) g_kbShift = !g_kbShift;
+              ImGui::SameLine();
+              if (ImGui::Button("space", {bw * 4.f + sp * 3.f, bh})) kbAppend(" ");
+              ImGui::SameLine();
+              if (ImGui::Button("del", {bw * 2.f + sp, bh})) { size_t n = strlen(g_keyBuf); if (n) g_keyBuf[n - 1] = 0; }
+              ImGui::SameLine();
+              if (ImGui::Button("clr", {bw * 2.f + sp, bh})) g_keyBuf[0] = 0;
+              bool click = ImGui::Button("Unlock", {-1.f, bh});
               if (!g_licStatus.empty()) ImGui::TextColored({1.f, 0.4f, 0.4f, 1.f}, "%s", g_licStatus.c_str());
-              if ((enter || click) && g_keyBuf[0]) {
+              if (click && g_keyBuf[0]) {
                   if (licenseCheck(g_keyBuf)) { saveKey(g_keyBuf); g_licensed = true; g_licStatus.clear(); }
-                  else g_licStatus = "invalid key";
+                  else g_licStatus = g_licErr.empty() ? "invalid key" : g_licErr;   // real failure reason, not a generic label
               }
               ImGui::End();
           }
-          
+
           // resolves the libcheat.so path the way main() used to (argv override / embedded / next to the binary)
           static bool resolveLib(int argc, char** argv, bool overlayOnly, char* lib, size_t cap, bool& emb) {
               emb = false;
