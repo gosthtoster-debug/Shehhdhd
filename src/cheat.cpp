@@ -1514,27 +1514,76 @@ static int tcpConnect(const char* host, int port) {
     return fd;
 }
 
-// classic OpenSSL symbol names, resolved by hand from the device's libssl.so.
+// ---- on-device libssl (BoringSSL), resolved by hand. Entry points differ between Android builds, so each
+// one has fallbacks and a failed resolve reports the exact missing names in the log.
+struct SslApi {
+    void* (*TLS_client_method)();
+    void* (*SSL_CTX_new)(void*);
+    void  (*SSL_CTX_set_verify)(void*, int, void*);
+    void  (*SSL_CTX_free)(void*);
+    void* (*SSL_new)(void*);
+    int   (*SSL_set_fd)(void*, int);
+    int   (*SSL_set_tlsext_host_name)(void*, const char*);
+    long  (*SSL_ctrl)(void*, int, long, void*);
+    int   (*SSL_connect)(void*);
+    int   (*SSL_write)(void*, const void*, int);
+    int   (*SSL_read)(void*, void*, int);
+    int   (*SSL_shutdown)(void*);
+    void  (*SSL_free)(void*);
+};
+
+static void* symAny(void* h, const char* a, const char* b, const char* c) {
+    void* p = dlsym(h, a);
+    if (!p && b) p = dlsym(h, b);
+    if (!p && c) p = dlsym(h, c);
+    return p;
+}
+
+static void addMiss(char* miss, size_t cap, const char* name) {
+    size_t n = strlen(miss);
+    if (n + strlen(name) + 2 < cap) { strcat(miss, name); strcat(miss, " "); }
+}
+
+static bool sslResolve(void* h, SslApi& a, char* miss, size_t cap) {
+    miss[0] = 0;
+    a.TLS_client_method        = (decltype(a.TLS_client_method))       symAny(h, "TLS_client_method", "TLS_method", "SSLv23_client_method");
+    a.SSL_CTX_new              = (decltype(a.SSL_CTX_new))             symAny(h, "SSL_CTX_new", nullptr, nullptr);
+    a.SSL_CTX_set_verify       = (decltype(a.SSL_CTX_set_verify))      symAny(h, "SSL_CTX_set_verify", nullptr, nullptr);
+    a.SSL_CTX_free             = (decltype(a.SSL_CTX_free))            symAny(h, "SSL_CTX_free", nullptr, nullptr);
+    a.SSL_new                  = (decltype(a.SSL_new))                 symAny(h, "SSL_new", nullptr, nullptr);
+    a.SSL_set_fd               = (decltype(a.SSL_set_fd))              symAny(h, "SSL_set_fd", nullptr, nullptr);
+    a.SSL_set_tlsext_host_name = (decltype(a.SSL_set_tlsext_host_name))symAny(h, "SSL_set_tlsext_host_name", nullptr, nullptr);
+    a.SSL_ctrl                 = (decltype(a.SSL_ctrl))                symAny(h, "SSL_ctrl", nullptr, nullptr);
+    a.SSL_connect              = (decltype(a.SSL_connect))             symAny(h, "SSL_connect", nullptr, nullptr);
+    a.SSL_write                = (decltype(a.SSL_write))               symAny(h, "SSL_write", nullptr, nullptr);
+    a.SSL_read                 = (decltype(a.SSL_read))                symAny(h, "SSL_read", nullptr, nullptr);
+    a.SSL_shutdown             = (decltype(a.SSL_shutdown))            symAny(h, "SSL_shutdown", nullptr, nullptr);
+    a.SSL_free                 = (decltype(a.SSL_free))                symAny(h, "SSL_free", nullptr, nullptr);
+    // required; set_verify / shutdown / frees are optional (a leak or a skipped close does not matter here)
+    if (!a.TLS_client_method) addMiss(miss, cap, "TLS_client_method");
+    if (!a.SSL_CTX_new)      addMiss(miss, cap, "SSL_CTX_new");
+    if (!a.SSL_new)          addMiss(miss, cap, "SSL_new");
+    if (!a.SSL_set_fd)       addMiss(miss, cap, "SSL_set_fd");
+    if (!a.SSL_connect)      addMiss(miss, cap, "SSL_connect");
+    if (!a.SSL_write)        addMiss(miss, cap, "SSL_write");
+    if (!a.SSL_read)         addMiss(miss, cap, "SSL_read");
+    if (!a.SSL_set_tlsext_host_name && !a.SSL_ctrl) addMiss(miss, cap, "SSL_set_tlsext_host_name/SSL_ctrl");   // SNI is mandatory on Cloudflare
+    return miss[0] == 0;
+}
+
 // reqBody == nullptr -> GET, otherwise POST with a JSON body.
 static bool httpsRequest(const char* host, const char* path, const char* reqBody, char* out, size_t outCap) {
-    void* libssl = dlopen("libssl.so", RTLD_NOW);
-    if (!libssl) { EPRINT("license: libssl.so not found\n"); return false; }
-    auto TLS_client_method  = (void* (*)())dlsym(libssl, "TLS_client_method");
-    auto SSL_CTX_new        = (void* (*)(void*))dlsym(libssl, "SSL_CTX_new");
-    auto SSL_CTX_set_verify = (void  (*)(void*, int, void*))dlsym(libssl, "SSL_CTX_set_verify");
-    auto SSL_CTX_free       = (void  (*)(void*))dlsym(libssl, "SSL_CTX_free");
-    auto SSL_new            = (void* (*)(void*))dlsym(libssl, "SSL_new");
-    auto SSL_set_fd         = (int   (*)(void*, int))dlsym(libssl, "SSL_set_fd");
-    auto SSL_ctrl           = (long  (*)(void*, int, long, void*))dlsym(libssl, "SSL_ctrl");
-    auto SSL_connect        = (int   (*)(void*))dlsym(libssl, "SSL_connect");
-    auto SSL_write          = (int   (*)(void*, const void*, int))dlsym(libssl, "SSL_write");
-    auto SSL_read           = (int   (*)(void*, void*, int))dlsym(libssl, "SSL_read");
-    auto SSL_shutdown       = (int   (*)(void*))dlsym(libssl, "SSL_shutdown");
-    auto SSL_free           = (void  (*)(void*))dlsym(libssl, "SSL_free");
-    if (!TLS_client_method || !SSL_CTX_new || !SSL_CTX_free || !SSL_new || !SSL_set_fd || !SSL_ctrl ||
-        !SSL_connect || !SSL_write || !SSL_read || !SSL_shutdown || !SSL_free) {
-        EPRINT("license: libssl symbol resolve failed (vendor BoringSSL layout differs)\n"); return false;
+    static const char* const LIBS[] = { "libssl.so", "/apex/com.android.conscrypt/lib64/libssl.so", "/system/lib64/libssl.so" };
+    SslApi a{};
+    bool have = false;
+    for (const char* lib : LIBS) {
+        void* h = dlopen(lib, RTLD_NOW);
+        if (!h) { EPRINT("license: dlopen %s failed\n", lib); continue; }
+        char miss[192];
+        if (sslResolve(h, a, miss, sizeof(miss))) { have = true; EPRINT("license: using %s\n", lib); break; }
+        EPRINT("license: %s missing: %s\n", lib, miss);
     }
+    if (!have) { EPRINT("license: no usable libssl\n"); return false; }
 
     // build the request first: nothing is opened yet, so early-outs need no cleanup
     char req[768];
@@ -1553,33 +1602,37 @@ static bool httpsRequest(const char* host, const char* path, const char* reqBody
     int fd = tcpConnect(host, 443);
     if (fd < 0) { EPRINT("license: tcp connect failed (no network?)\n"); return false; }
 
-    void* ctx = SSL_CTX_new(TLS_client_method());
+    void* ctx = a.SSL_CTX_new(a.TLS_client_method());
     if (!ctx) { EPRINT("license: SSL_CTX_new failed\n"); close(fd); return false; }
     // FILL(security): VERIFY_NONE means a MITM can answer {"valid":true}. Replace with CA verification
     // or a signed response before shipping.
-    if (SSL_CTX_set_verify) SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);
-    void* ssl = SSL_new(ctx);
-    if (!ssl) { EPRINT("license: SSL_new failed\n"); SSL_CTX_free(ctx); close(fd); return false; }
-    SSL_set_fd(ssl, fd);
-    SSL_ctrl(ssl, 55 /*SSL_CTRL_SET_TLSEXT_HOSTNAME*/, 0 /*TLSEXT_NAMETYPE_host_name*/, (void*)host);  // SNI, Cloudflare routes on it
-    if (SSL_connect(ssl) != 1) {
+    if (a.SSL_CTX_set_verify) a.SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);
+    void* ssl = a.SSL_new(ctx);
+    if (!ssl) { EPRINT("license: SSL_new failed\n"); if (a.SSL_CTX_free) a.SSL_CTX_free(ctx); close(fd); return false; }
+    a.SSL_set_fd(ssl, fd);
+    if (a.SSL_set_tlsext_host_name) a.SSL_set_tlsext_host_name(ssl, host);
+    else a.SSL_ctrl(ssl, 55 /*SSL_CTRL_SET_TLSEXT_HOSTNAME*/, 0 /*TLSEXT_NAMETYPE_host_name*/, (void*)host);
+    if (a.SSL_connect(ssl) != 1) {
         EPRINT("license: TLS handshake failed\n");
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false;
+        if (a.SSL_free) a.SSL_free(ssl);
+        if (a.SSL_CTX_free) a.SSL_CTX_free(ctx);
+        close(fd); return false;
     }
 
-    if (SSL_write(ssl, req, n) != n) {
-        EPRINT("license: request write failed\n");
-        SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false;
-    }
-
+    bool wrote = a.SSL_write(ssl, req, n) == n;
     size_t total = 0;
-    while (total + 1 < outCap) {
-        int r = SSL_read(ssl, out + total, (int)(outCap - 1 - total));
-        if (r <= 0) break;
-        total += (size_t)r;
-    }
+    if (wrote) {
+        while (total + 1 < outCap) {
+            int r = a.SSL_read(ssl, out + total, (int)(outCap - 1 - total));
+            if (r <= 0) break;
+            total += (size_t)r;
+        }
+    } else EPRINT("license: request write failed\n");
     out[total] = 0;
-    SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+    if (a.SSL_shutdown) a.SSL_shutdown(ssl);
+    if (a.SSL_free) a.SSL_free(ssl);
+    if (a.SSL_CTX_free) a.SSL_CTX_free(ctx);
+    close(fd);
     return total > 0;
 }
 
