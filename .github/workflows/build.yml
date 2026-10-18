@@ -532,7 +532,8 @@ jobs:
               constexpr float       HEAD_H     = 1.8f;
               constexpr int         POLL_MS    = 50;
               constexpr int         MAX_ENT    = 64;
-              constexpr float       AIM_STEP   = 8.f;    // max deg/frame written per axis
+              constexpr float       AIM_STEP   = 8.f;    // max deg per 16.7 ms written per axis (scaled by real dt)
+              constexpr float       AIM_FF     = 0.6f;   // look-ahead gain on the target's screen motion, 0 = off
               constexpr const char* CFG_PATH   = "/data/local/tmp/.oxide_cfg.json";
               constexpr const char* LIB_DST    = "/data/data/com.catsbit.oxidesurvivalisland/cache/libcheat.so";
               constexpr const char* SHM_PATH   = "/data/data/com.catsbit.oxidesurvivalisland/cache/.oxe.shm";
@@ -547,11 +548,16 @@ jobs:
           #endif
 
           // ── shared between payload and host (identical layout, both compiled from this file) ──
+          enum Joint { J_HEAD, J_NECK, J_CHEST, J_HIPS, J_LSH, J_LEL, J_LHA, J_RSH, J_REL, J_RHA,
+                       J_LHIP, J_LKN, J_LFT, J_RHIP, J_RKN, J_RFT, J_N };
           struct Ent {
               float fx, fy, hx, hy;   // feet/head screen px, Unity convention: origin bottom-left, game resolution (sw x sh)
               float hp, hpMax, dist;
               int   team;             // 1 = same team as local player
               bool  alive;
+              uint32_t jmask;         // bit j set = joint j visible on screen (jx/jy valid); 0 = no skeleton data
+              float jx[J_N], jy[J_N]; // joint screen px, same convention as fx/fy
+              char  name[32];         // player display name, utf-8, refreshed ~1/s
           };
           struct Ctl {                // host -> payload (plain writes, torn reads are harmless)
               int32_t aim;            // master toggle
@@ -565,6 +571,10 @@ jobs:
               float   aimH;           // 0 = feet .. 1 = top of head
               float   vfov;           // vertical camera fov, deg (px -> deg)
               float   maxDist;        // m
+              int32_t skel;           // host: skeleton esp on -> payload collects joints
+              int32_t aimBone;        // 0 head, 1 neck, 2 chest, 3 pelvis, 4 closest joint to crosshair
+              int32_t lead;           // predict target motion + bullet drop
+              float   leadSpeed;      // m/s, 0 = read BulletSpeed from the equipped hitscan config
           };
           struct Shm {
               volatile uint32_t seq;  // seqlock: odd = writer busy
@@ -607,12 +617,17 @@ jobs:
               constexpr uintptr_t GetPosition  = 0xCD53504;   // UnityEngine.Transform.get_position()
               constexpr uintptr_t ScrW         = 0xCCD1820;   // UnityEngine.Screen.get_width()         static
               constexpr uintptr_t ScrH         = 0xCCD1848;   // UnityEngine.Screen.get_height()        static
+              constexpr uintptr_t BalStep      = 0xC2FBF10;   // Oxide.Utils.Combat.BallisticIntegrator.Step(ref BallisticState, in BallisticParams, float dt) static
+              constexpr uintptr_t GetGO        = 0xCD39F78;   // UnityEngine.Component.get_gameObject()
+              constexpr uintptr_t GoActive     = 0xCD3F428;   // UnityEngine.GameObject.get_activeInHierarchy()
+              constexpr uintptr_t GetBone      = 0xCC9579C;   // UnityEngine.Animator.GetBoneTransform(HumanBodyBones) -> Transform, null if not humanoid
               // first 4 words of Update(): must match, they are copied into the trampoline (PC-independent, checked offline)
               constexpr uint32_t UpdatePrologue[4] = {0xd10203ff, 0x6d0323e9, 0xa90467fe, 0xa9055ff8};
           }
           namespace off2 {                      // field offsets (dump.cs / il2cpp.h)
               constexpr uintptr_t pm_events = 0x78;    // PlayerManager.playerEventHandler (hsL : hsN)
               constexpr uintptr_t pm_vitals = 0xC8;    // PlayerManager.vitals
+              constexpr uintptr_t pm_animator = 0x1B0; // PlayerManager.animator (Animator) - dump.cs, humanoid rig assumed
               constexpr uintptr_t pm_team   = 0x2A0;   // PlayerManager.teamName (string)
               constexpr uintptr_t ev_health = 0x98;    // hsN.Health -> hkz<float,..>
               constexpr uintptr_t hk_value  = 0x20;    // hkz<float,..> current value; verified in libil2cpp: Kek() = ldr s0,[x0,#0x20]
@@ -623,14 +638,18 @@ jobs:
               //   which component is yaw/pitch, the sign and the unit are NOT known: aimStep measures them at runtime (jacobian probe).
               constexpr uintptr_t pm_look   = 0x70;
               constexpr uintptr_t ml_ang    = 0x4C;
-              // no-spread. FILL: nothing in this file knows the weapon layout, get it from dump.cs (Il2CppDumper):
-              //   pm_weapon : offset of the field on Oxide.PlayerManager that holds the equipped weapon/gun object (type name ~ Weapon/Gun/Firearm)
-              //   wp_spread : offsets of the float fields on that class (or its stats/config object, then add one more deref) named ~ spread/bloom/inaccuracy/deviation
-              //   check live in CE: fire while moving, the value jumps; freeze it at 0 and the group must tighten. 0 = slot unused.
-              //   dump11966 checked: no readable spread field (the 'Spread' hits are AudioSource settings), weapon fields are obfuscated -> CE scan needed.
-              //   if spread is only computed inside a method (no stored float), hook that getter to return 0 instead.
-              constexpr uintptr_t pm_weapon = 0x0;
-              constexpr uintptr_t wp_spread[4] = {0x0, 0x0, 0x0, 0x0};
+              // weapons (dump.cs). guns are FPHitscan; their HitscanWeaponConfig / DispersionConfig are shared ScriptableObjects
+              constexpr uintptr_t klass_name   = 0x10;   // Il2CppClass.name (il2cpp v29+, x64) - used to recognise FPHitscan
+              constexpr uintptr_t pm_weapons   = 0x1B8;  // PlayerManager.weapons (FPWeaponBase[])
+              constexpr uintptr_t fw_config    = 0x130;  // FPHitscan.config (HitscanWeaponConfig)
+              constexpr uintptr_t hc_damage    = 0x18;   // HitscanWeaponConfig.damage            (sanity check)
+              constexpr uintptr_t hc_bulletSpeed = 0x30; // HitscanWeaponConfig.BulletSpeed       (lead)
+              constexpr uintptr_t hc_baseDisp  = 0x3C;   // HitscanWeaponConfig.BaseDispersion    (no-spread)
+              constexpr uintptr_t hc_ballistic = 0x60;   // HitscanWeaponConfig.ballistic (BallisticProfile)
+              constexpr uintptr_t hc_dispCfg   = 0x68;   // HitscanWeaponConfig.dispersionConfig  (no-spread)
+              constexpr uintptr_t bp_gravity   = 0x10;   // BallisticProfile.gravity              (lead drop)
+              constexpr uintptr_t dc_first     = 0x18;   // DispersionConfig: minFire maxFire min max increasePerShot = 5 floats
+              constexpr uintptr_t ev_name      = 0x88;   // hsN.DisplayName
           }
 
           struct V3 { float x, y, z; };
@@ -642,6 +661,10 @@ jobs:
           static uint64_t nowMs() {
               timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
               return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+          }
+          static uint64_t nowUs() {
+              timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
           }
           static bool shmOpen() {
               int fd = open(off::SHM_PATH, O_RDWR | O_CREAT, 0666);
@@ -716,12 +739,16 @@ jobs:
           typedef void* (*ObjFn1)(void*, void*);
           typedef V3    (*PosFn)(void*, void*);
           typedef V3    (*W2SFn)(void*, V3, void*);
+          typedef void* (*BoneFn)(void*, int, void*);
+          struct BParams { float gravity, airDrag, underwaterDrag; };   // Oxide.Utils.Combat.BallisticParams (dump.cs: 0x0/0x4/0x8)
+          struct BState  { V3 pos, vel; };                              // BallisticState: Position @0x0, Velocity @0xC
+          typedef void  (*BalStepFn)(BState*, const BParams*, float, void*);
 
           static BoolFn fIsLocal; static IntFn fScrW, fScrH; static ObjFn0 fCamMain;
-          static ObjFn1 fGetTransform; static PosFn fGetPosition; static W2SFn fW2S;
+          static ObjFn1 fGetTransform; static PosFn fGetPosition; static W2SFn fW2S; static BoneFn fGetBone; static ObjFn1 fGetGO; static BoolFn fGoActive; static BalStepFn fBalStep;
           static void (*orig_update)(void*, void*) = nullptr;
 
-          struct Slot { void* obj; uint64_t ts; uint64_t teamTs; Ent e; };
+          struct Slot { void* obj; uint64_t ts; uint64_t teamTs; Ent e; V3 wfeet; V3 jw[J_N]; uint32_t jwMask; uint64_t boneRetry; V3 pp, vel; uint64_t pt, nameTs; };
           static Slot g_slots[off::MAX_ENT];
           static Name g_localTeam;
           static int  g_sw = 0, g_sh = 0;
@@ -736,22 +763,138 @@ jobs:
                   if (s.ts < oldest->ts) oldest = &s;
               }
               Slot* s = freeS ? freeS : oldest;
-              s->obj = obj; s->ts = 0; s->teamTs = 0; return s;
+              s->obj = obj; s->ts = 0; s->teamTs = 0; s->nameTs = 0; s->pt = 0; s->vel = V3{0.f, 0.f, 0.f}; s->e.name[0] = 0; return s;
           }
           static void dropSlot(void* obj) {
               for (int i = 0; i < off::MAX_ENT; i++) if (g_slots[i].obj == obj) { g_slots[i].obj = nullptr; g_slots[i].ts = 0; }
           }
 
-          static void noSpreadStep(void* self) {
-              if (!g_shm || !g_shm->ctl.noSpread) return;
-              if (!off2::pm_weapon) { static bool w = false; if (!w) { w = true; LOG("nospread: off2::pm_weapon not filled (FILL in off2)"); } return; }
-              void* wp = *(void**)((uintptr_t)self + off2::pm_weapon);
-              if (!wp) return;
-              for (uintptr_t o : off2::wp_spread) {
-                  if (!o) continue;
-                  float* f = (float*)((uintptr_t)wp + o);
-                  if (*f > 0.f && *f < 100.f) *f = 0.f;     // only touch plausible spread values: wrong offset = no write
+          static void toUtf8(const Name& n, char* out, int cap) {
+              int o = 0;
+              for (int i = 0; i < n.n && o < cap - 4; i++) {
+                  uint32_t c = n.c[i];
+                  if (c >= 0xD800 && c < 0xDC00 && i + 1 < n.n) { c = 0x10000 + ((c - 0xD800) << 10) + (n.c[++i] - 0xDC00); }
+                  if (c < 0x80) out[o++] = (char)c;
+                  else if (c < 0x800) { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 63)); }
+                  else if (c < 0x10000) { out[o++] = (char)(0xE0 | (c >> 12)); out[o++] = (char)(0x80 | ((c >> 6) & 63)); out[o++] = (char)(0x80 | (c & 63)); }
+                  else { out[o++] = (char)(0xF0 | (c >> 18)); out[o++] = (char)(0x80 | ((c >> 12) & 63)); out[o++] = (char)(0x80 | ((c >> 6) & 63)); out[o++] = (char)(0x80 | (c & 63)); }
               }
+              out[o] = 0;
+          }
+
+          // ── weapons: no-spread, plus bullet speed / gravity of the equipped gun for the lead calculation ──
+          // HitscanWeaponConfig + DispersionConfig are shared ScriptableObjects: originals are saved and put back when the toggle goes off.
+          // NOT verified on device: if the game copies these values into runtime state once at equip, zeroing the config won't tighten the spread.
+          struct WpSaved { void* cfg; float base; void* disp; float d[5]; bool on; };
+          static WpSaved  g_ws[6];
+          static float    g_bulletSpeed = 0.f, g_gravity = 0.f;
+          static BParams  g_bal{}; static bool g_balOk = false;     // equipped gun's BallisticProfile, fed to the game's own integrator
+          static uint64_t g_wpTs = 0;
+          static void*    g_hsKlass = nullptr;
+          static bool plaus(float v, float lo, float hi) { return __builtin_isfinite(v) && v >= lo && v <= hi; }
+
+          static bool isHitscan(void* w) {                                   // class name check: the config field offset only means something on FPHitscan
+              void* k = *(void**)w; if (!k) return false;
+              if (k == g_hsKlass) return true;
+              const char* nm = *(const char**)((uintptr_t)k + off2::klass_name);
+              if ((uintptr_t)nm < 0x10000) return false;
+              if (strcmp(nm, "FPHitscan") != 0) return false;
+              g_hsKlass = k; return true;
+          }
+          static void* activeHitscanCfg(void* self) {
+              void* arr = *(void**)((uintptr_t)self + off2::pm_weapons); if (!arr) return nullptr;
+              uintptr_t len = *(uintptr_t*)((uintptr_t)arr + 0x18);          // il2cpp array: max_length @0x18, items @0x20
+              if (len == 0 || len > 16) return nullptr;
+              for (uintptr_t i = 0; i < len; i++) {
+                  void* w = *(void**)((uintptr_t)arr + 0x20 + 8 * i); if (!w) continue;
+                  void* go = fGetGO(w, nullptr); if (!go || !fGoActive(go, nullptr)) continue;   // the equipped one is the active one
+                  if (!isHitscan(w)) continue;
+                  void* cfg = *(void**)((uintptr_t)w + off2::fw_config); if (!cfg) continue;
+                  float dmg = *(float*)((uintptr_t)cfg + off2::hc_damage), bd = *(float*)((uintptr_t)cfg + off2::hc_baseDisp);
+                  if (plaus(dmg, 0.f, 100000.f) && plaus(bd, 0.f, 360.f)) return cfg;
+              }
+              return nullptr;
+          }
+          static void noSpreadStep(void* self) {
+              if (!g_shm) return;
+              uint64_t now = nowMs();
+              if (now - g_wpTs < 250) return;
+              g_wpTs = now;
+              const Ctl& c = g_shm->ctl;
+              bool ns = c.noSpread != 0;
+              void* cfg = (ns || c.lead) ? activeHitscanCfg(self) : nullptr;
+              g_bulletSpeed = 0.f; g_gravity = 0.f; g_balOk = false;
+              if (cfg) {
+                  float bs = *(float*)((uintptr_t)cfg + off2::hc_bulletSpeed);
+                  if (plaus(bs, 1.f, 10000.f)) g_bulletSpeed = bs;
+                  void* bal = *(void**)((uintptr_t)cfg + off2::hc_ballistic);
+                  if (bal) {
+                      float g = *(float*)((uintptr_t)bal + off2::bp_gravity), dr = *(float*)((uintptr_t)bal + off2::bp_gravity + 4), uw = *(float*)((uintptr_t)bal + off2::bp_gravity + 8);
+                      if (plaus(g, -60.f, 60.f)) g_gravity = fabsf(g);
+                      if (plaus(g, -60.f, 60.f) && plaus(dr, 0.f, 50.f) && plaus(uw, 0.f, 500.f)) {
+                          g_bal = BParams{g, dr, uw}; g_balOk = true;
+                          static float lg = -1e9f, ld = -1e9f, ls = -1e9f;
+                          if (g != lg || dr != ld || bs != ls) { lg = g; ld = dr; ls = bs; LOG("ballistics: speed=%.0f gravity=%.2f airDrag=%.3f underwaterDrag=%.2f", bs, g, dr, uw); }
+                      }
+                  }
+              }
+              if (ns && cfg) {
+                  void* disp = *(void**)((uintptr_t)cfg + off2::hc_dispCfg);
+                  WpSaved* sv = nullptr;
+                  for (auto& x : g_ws) if (x.on && x.cfg == cfg) { sv = &x; break; }
+                  if (!sv) {
+                      for (auto& x : g_ws) if (!x.on) { sv = &x; break; }
+                      if (!sv) return;
+                      sv->cfg = cfg; sv->disp = disp; sv->base = *(float*)((uintptr_t)cfg + off2::hc_baseDisp);
+                      for (int i = 0; i < 5; i++) sv->d[i] = disp ? *(float*)((uintptr_t)disp + off2::dc_first + 4 * i) : 0.f;
+                      sv->on = true;
+                      LOG("nospread: cfg=%p base=%.3f disp=%p (%.3f %.3f %.3f %.3f %.3f) bulletSpeed=%.0f", cfg, sv->base, disp, sv->d[0], sv->d[1], sv->d[2], sv->d[3], sv->d[4], g_bulletSpeed);
+                  }
+                  *(float*)((uintptr_t)cfg + off2::hc_baseDisp) = 0.f;
+                  if (disp) for (int i = 0; i < 5; i++) {
+                      float* f = (float*)((uintptr_t)disp + off2::dc_first + 4 * i);
+                      if (plaus(*f, 0.f, 1000.f)) *f = 0.f;                 // wrong offset = value won't look like a dispersion = no write
+                  }
+              }
+              if (!ns) for (auto& x : g_ws) if (x.on) {
+                  *(float*)((uintptr_t)x.cfg + off2::hc_baseDisp) = x.base;
+                  if (x.disp) for (int i = 0; i < 5; i++) *(float*)((uintptr_t)x.disp + off2::dc_first + 4 * i) = x.d[i];
+                  x.on = false;
+              }
+          }
+          static inline V3    v3sub(V3 a, V3 b) { return V3{a.x - b.x, a.y - b.y, a.z - b.z}; }
+          static inline V3    v3add(V3 a, V3 b) { return V3{a.x + b.x, a.y + b.y, a.z + b.z}; }
+          static inline V3    v3mul(V3 a, float k) { return V3{a.x * k, a.y * k, a.z * k}; }
+          static inline float v3dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+          // ballistics: runs the game's own BallisticIntegrator, so gravity + drag match the server model exactly (no guessed drag formula).
+          // fixed point: fire at A, see where the bullet crosses the plane of the target, move A by the miss, repeat.
+          // `aim` = point to put the crosshair on, `tof` = time of flight. false = bullet never reaches that range (too slow / too far).
+          // assumes the shot starts at the camera `o`; if the muzzle offset matters at close range, pass the muzzle position instead.
+          static bool ballisticSolve(V3 o, V3 T, float v0, const BParams& p, V3& aim, float& tof) {
+              V3 toT = v3sub(T, o); float dT = sqrtf(v3dot(toT, toT));
+              if (dT < 0.5f) { aim = T; tof = 0.f; return true; }
+              V3 nT = v3mul(toT, 1.f / dT);
+              V3 A = T;
+              for (int it = 0; it < 6; it++) {
+                  V3 d = v3sub(A, o); float dl = sqrtf(v3dot(d, d)); if (dl < 0.01f) return false;
+                  BState st{o, v3mul(d, v0 / dl)};
+                  const float DT = 0.0125f; float t = 0.f; bool hit = false; V3 hp{0.f, 0.f, 0.f};
+                  for (int i = 0; i < 240; i++) {                                  // up to 3 s of flight
+                      V3 prev = st.pos; fBalStep(&st, &p, DT, nullptr); t += DT;
+                      float a0 = v3dot(v3sub(prev, o), nT), a1 = v3dot(v3sub(st.pos, o), nT);   // progress along o->T
+                      if (a1 >= dT) {
+                          float f = (a1 - a0) > 1e-6f ? (dT - a0) / (a1 - a0) : 1.f;
+                          hp = v3add(prev, v3mul(v3sub(st.pos, prev), f)); tof = t - DT + DT * f; hit = true; break;
+                      }
+                      if (a1 < a0 - 1.f) return false;                             // flying backwards
+                  }
+                  if (!hit) return false;
+                  V3 miss = v3sub(T, hp);
+                  A = v3add(A, miss);
+                  if (v3dot(miss, miss) < 0.0004f) break;                          // < 2 cm
+              }
+              aim = A; return true;
           }
           static void aimDbg(const char* tag, float a0, float a1, float e0, float e1, uint64_t now) {   // rate-limited logcat: `logcat -s tongdlc`
               static uint64_t last = 0;
@@ -770,22 +913,137 @@ jobs:
           static float g_lastBest = 0.f;
           static const float PROBE = 1.5f;
 
+          // camera + its position cached for one frame (16 ms): Camera.main / get_transform / get_position once, not once per player
+          struct CamCache { void* cam; V3 pos; uint64_t ts; };
+          static CamCache g_cc;
+          static CamCache* getCam(uint64_t now) {
+              if (g_cc.cam && now - g_cc.ts < 16) return &g_cc;
+              g_cc.cam = nullptr;
+              void* cam = fCamMain(nullptr);              if (!cam) return nullptr;
+              void* ct  = fGetTransform(cam, nullptr);    if (!ct)  return nullptr;
+              g_cc.cam = cam; g_cc.pos = fGetPosition(ct, nullptr); g_cc.ts = now;
+              return &g_cc;
+          }
+
+          // ── skeleton: 16 joints through Animator.GetBoneTransform (humanoid rig). world pos kept for fresh re-projection by the aimbot ──
+          static const int HB[J_N] = {10, 9, 8, 0, 13, 15, 17, 14, 16, 18, 1, 3, 5, 2, 4, 6};   // HumanBodyBones: Head Neck Chest Hips, L/R UpperArm LowerArm Hand, L/R UpperLeg LowerLeg Foot
+          static void collectBones(void* self, Slot* s, CamCache* cc, uint64_t now, uint32_t need) {
+              if (now < s->boneRetry) return;
+              void* an = *(void**)((uintptr_t)self + off2::pm_animator);
+              if (!an) { s->boneRetry = now + 2000; return; }
+              for (int j = 0; j < J_N; j++) {
+                  if (!(need & (1u << j))) continue;                            // 3 managed calls per joint: skip what nobody uses
+                  void* t = fGetBone(an, HB[j], nullptr);
+                  if (!t && j == J_CHEST) t = fGetBone(an, 7, nullptr);          // rigs without a Chest bone: Spine
+                  if (!t) continue;
+                  V3 w = fGetPosition(t, nullptr);
+                  if (!(__builtin_isfinite(w.x) && __builtin_isfinite(w.y) && __builtin_isfinite(w.z))) continue;
+                  s->jw[j] = w; s->jwMask |= 1u << j;
+                  V3 sp = fW2S(cc->cam, w, nullptr);
+                  if (sp.z <= 0.f) continue;
+                  s->e.jx[j] = sp.x; s->e.jy[j] = sp.y; s->e.jmask |= 1u << j;
+              }
+              if (!(s->jwMask & ((1u << J_HEAD) | (1u << J_HIPS)))) s->boneRetry = now + 2000;   // not humanoid / not ready: stop hammering it
+          }
+
+          // ── aim: target + joint selection, sticky so it doesn't flip between players or bones ──
+          static const int AIM_BONES[4] = {J_HEAD, J_NECK, J_CHEST, J_HIPS};
+          // returns joint index, or -1 when the slot has no skeleton (caller falls back to the aimH line feet->head)
+          static int pickBone(const Slot& s, int mode, float cx, float cy, int prevBone, float& px, float& py) {
+              uint32_t m = s.e.jmask;
+              if (!m) return -1;
+              if (mode >= 0 && mode < 4) {
+                  for (int k = 0; k < 4; k++) {
+                      int j = AIM_BONES[(mode + k) % 4];
+                      if (m & (1u << j)) { px = s.e.jx[j]; py = s.e.jy[j]; return j; }
+                  }
+              }
+              int bj = -1; float bd = 1.0e18f;
+              for (int j = 0; j < J_N; j++) {
+                  if (!(m & (1u << j))) continue;
+                  float dx = s.e.jx[j] - cx, dy = s.e.jy[j] - cy, d = dx * dx + dy * dy;
+                  if (d < bd) { bd = d; bj = j; }
+              }
+              if (bj < 0) return -1;
+              if (prevBone >= 0 && (m & (1u << prevBone))) {                 // bone hysteresis: stay on the old joint unless another is clearly closer
+                  float dx = s.e.jx[prevBone] - cx, dy = s.e.jy[prevBone] - cy;
+                  if (sqrtf(dx * dx + dy * dy) <= sqrtf(bd) + 14.f) bj = prevBone;
+              }
+              px = s.e.jx[bj]; py = s.e.jy[bj];
+              return bj;
+          }
+
+          static int      g_tSlot = -1, g_tBone = -1;
+          static void*    g_tObj = nullptr;
+          static uint64_t g_aimLastUs = 0;
+          static float    g_lstp0 = 0.f, g_lstp1 = 0.f;    // step actually written last frame
+          static float    g_pex = 0.f, g_pey = 0.f;        // previous screen error
+          static float    g_vtX = 0.f, g_vtY = 0.f;        // target motion on screen, px/ms (error change not caused by our own steps)
+          static int      g_prevTid = -1;
+          static bool     g_havePrev = false;
+          static float    g_stp0 = 0.f, g_stp1 = 0.f;      // last applied step (output low-pass state)
+          static bool     g_holdLock = false;              // dead-zone hysteresis latch
+          static void aimReset() {
+              g_tSlot = -1; g_tBone = -1; g_tObj = nullptr; g_stp0 = g_stp1 = 0.f; g_holdLock = false;
+              g_lstp0 = g_lstp1 = 0.f; g_vtX = g_vtY = 0.f; g_havePrev = false; g_prevTid = -1;
+          }
+
+          // what changed vs the old step: (1) target error is re-projected with the CURRENT camera every frame (old code used the
+          // screen point published up to 150 ms earlier -> the loop chased its own camera motion = the jitter), (2) frame-rate independent
+          // exponential approach instead of 1/smooth per frame, (3) low-pass on the applied step (no hard start/stop), (4) dead-zone with
+          // hysteresis (no hunting around the point), (5) sticky target and joint.
           static void aimStep(void* self, uint64_t now) {
-              if (!g_shm || !g_shm->ctl.aim || !g_shm->ctl.active || g_sw <= 0 || g_sh <= 0) { if (!g_cal.ok) g_cal.st = 0; return; }
+              uint64_t nus = nowUs();
+              float dtms = g_aimLastUs ? (float)(nus - g_aimLastUs) * 0.001f : 16.f; g_aimLastUs = nus;   // µs clock: integer ms made dt jitter 16/17
+              if (dtms < 1.f) dtms = 1.f; if (dtms > 50.f) dtms = 50.f;
+              if (!g_shm || !g_shm->ctl.aim || !g_shm->ctl.active || g_sw <= 0 || g_sh <= 0) { if (!g_cal.ok) g_cal.st = 0; aimReset(); return; }
               const Ctl& c = g_shm->ctl;
               float cx = (float)g_sw * 0.5f, cy = (float)g_sh * 0.5f;
-              float best = c.fov, bdx = 0.f, bdy = 0.f; int bi = -1;
               float maxD = c.maxDist > 1.f ? c.maxDist : 600.f;
+              int mode = g_cal.ok ? c.aimBone : 2;                      // calibrate on the chest: central, always there
+              float best = c.fov; int bi = -1, bj = -1;
+              bool haveCur = false; float curD = 0.f; int curJ = -1;
               for (int i = 0; i < off::MAX_ENT; i++) {
                   Slot& s = g_slots[i];
                   if (!s.obj || !s.e.alive || now - s.ts > 150) continue;
                   if (s.e.team && !c.aimTeam) continue;
                   if (s.e.dist > maxD) continue;
-                  float px = s.e.fx + (s.e.hx - s.e.fx) * c.aimH, py = s.e.fy + (s.e.hy - s.e.fy) * c.aimH;
+                  float px, py;
+                  int j = pickBone(s, mode, cx, cy, i == g_tSlot ? g_tBone : -1, px, py);
+                  if (j < 0) { px = s.e.fx + (s.e.hx - s.e.fx) * c.aimH; py = s.e.fy + (s.e.hy - s.e.fy) * c.aimH; }
                   float dx = px - cx, dy = py - cy, d = sqrtf(dx * dx + dy * dy);
-                  if (d < best) { best = d; bdx = dx; bdy = dy; bi = i; }
+                  if (i == g_tSlot && s.obj == g_tObj) { haveCur = true; curD = d; curJ = j; }
+                  if (d < best) { best = d; bi = i; bj = j; }
               }
-              if (bi < 0) { aimDbg("no-target(fov/dist/team)", 0, 0, 0, 0, now); if (!g_cal.ok) g_cal.st = 0; return; }
+              if (haveCur && curD < c.fov * 1.2f && bi != g_tSlot && best > curD * 0.7f) { bi = g_tSlot; bj = curJ; best = curD; }   // keep current target unless the new one is >30% closer
+              if (bi < 0) { aimDbg("no-target(fov/dist/team)", 0, 0, 0, 0, now); if (!g_cal.ok) g_cal.st = 0; aimReset(); return; }
+              if (bi != g_tSlot || g_slots[bi].obj != g_tObj) { g_stp0 = g_stp1 = 0.f; g_holdLock = false; }   // new target: restart the ramp
+              g_tSlot = bi; g_tObj = g_slots[bi].obj; g_tBone = bj;
+
+              // fresh error against the camera as it is right now
+              CamCache* cc = getCam(now); if (!cc) return;
+              Slot& ts = g_slots[bi];
+              V3 wp = (bj >= 0 && (ts.jwMask & (1u << bj))) ? ts.jw[bj] : V3{ts.wfeet.x, ts.wfeet.y + off::HEAD_H * c.aimH, ts.wfeet.z};
+              if (c.lead) {                                              // aim where the target will be when the bullet arrives (+ drop)
+                  float spd = c.leadSpeed > 1.f ? c.leadSpeed : g_bulletSpeed;
+                  if (spd > 1.f) {
+                      V3 T0 = wp, aim = wp; float tof = 0.f;
+                      for (int pass = 0; pass < 2; pass++) {                 // pass 2 re-solves with the target moved by vel * flight time
+                          V3 Tp{T0.x + ts.vel.x * tof, T0.y, T0.z + ts.vel.z * tof};
+                          if (g_balOk && fBalStep) { if (!ballisticSolve(cc->pos, Tp, spd, g_bal, aim, tof)) { aim = Tp; break; } }
+                          else {                                             // no ballistic profile: straight line + plain gravity drop
+                              float dx = Tp.x - cc->pos.x, dy = Tp.y - cc->pos.y, dz = Tp.z - cc->pos.z;
+                              tof = sqrtf(dx * dx + dy * dy + dz * dz) / spd; if (tof > 2.f) tof = 2.f;
+                              aim = Tp; if (g_gravity > 0.f) aim.y += 0.5f * g_gravity * tof * tof;
+                          }
+                      }
+                      wp = aim;
+                  }
+              }
+              V3 sp = fW2S(cc->cam, wp, nullptr);
+              if (sp.z <= 0.f) return;
+              float bdx = sp.x - cx, bdy = sp.y - cy, dist = sqrtf(bdx * bdx + bdy * bdy);
+
               void* ml = *(void**)((uintptr_t)self + off2::pm_look);
               if (!ml) { aimDbg("mouseLook null (pm_look)", 0, 0, 0, 0, now); return; }
               float* a = (float*)((uintptr_t)ml + off2::ml_ang);
@@ -794,6 +1052,7 @@ jobs:
               }
               Cal& k = g_cal;
               if (!k.ok) {                                              // ── calibration: yaw/pitch axis + sign + px-per-unit
+                  g_havePrev = false;
                   if (now < g_calRetry) return;
                   if (k.st == 0) { k.ex = bdx; k.ey = bdy; k.tid = bi; k.t = now; a[0] += PROBE; k.st = 1; return; }
                   if (now - k.t < 140) return;
@@ -814,30 +1073,52 @@ jobs:
                   LOG("aim CALIB ok J=[%.2f %.2f; %.2f %.2f] px/unit  (cols: JZC.x, JZC.y)", k.J00, k.J01, k.J10, k.J11);
                   return;
               }
-              if (best < 2.f) return;
-              if (bi == g_lastTid && best > g_lastBest + 0.5f) {        // error keeps growing on the same target -> jacobian is stale/wrong, redo
-                  if (++g_grow > 60) { k.ok = false; k.st = 0; g_grow = 0; aimDbg("recalibrating (error kept growing)", a[0], a[1], bdx, bdy, now); return; }
-              } else if (best < g_lastBest) g_grow = 0;
-              g_lastBest = best; g_lastTid = bi;
-              float sm = c.smooth < 1.f ? 1.f : c.smooth;
-              float da0 = -( k.J11 * bdx - k.J01 * bdy) / k.det / sm;   // solve J * da = -err
-              float da1 = -(-k.J10 * bdx + k.J00 * bdy) / k.det / sm;
-              if (da0 >  off::AIM_STEP) da0 =  off::AIM_STEP; if (da0 < -off::AIM_STEP) da0 = -off::AIM_STEP;
-              if (da1 >  off::AIM_STEP) da1 =  off::AIM_STEP; if (da1 < -off::AIM_STEP) da1 = -off::AIM_STEP;
-              a[0] += da0; a[1] += da1;
-              aimDbg("engaged", a[0], a[1], bdx, bdy, now);             // err must shrink over successive lines
-          }
+              // target motion on screen = how the error changed this frame minus what our own last step should have done to it
+              if (g_havePrev && bi == g_prevTid && dtms < 40.f) {
+                  float mx = (bdx - g_pex) - (k.J00 * g_lstp0 + k.J01 * g_lstp1);
+                  float my = (bdy - g_pey) - (k.J10 * g_lstp0 + k.J11 * g_lstp1);
+                  float al = 1.f - expf(-dtms / 60.f);                   // 60 ms low-pass, per-frame noise doesn't reach the output
+                  g_vtX += (mx / dtms - g_vtX) * al; g_vtY += (my / dtms - g_vtY) * al;
+              } else { g_vtX = g_vtY = 0.f; }
+              g_pex = bdx; g_pey = bdy; g_prevTid = bi; g_havePrev = true;
+              bool slowT = fabsf(g_vtX) + fabsf(g_vtY) < 0.06f;           // target (nearly) still on screen
 
-          // camera + its position cached for one frame (16 ms): Camera.main / get_transform / get_position once, not once per player
-          struct CamCache { void* cam; V3 pos; uint64_t ts; };
-          static CamCache g_cc;
-          static CamCache* getCam(uint64_t now) {
-              if (g_cc.cam && now - g_cc.ts < 16) return &g_cc;
-              g_cc.cam = nullptr;
-              void* cam = fCamMain(nullptr);              if (!cam) return nullptr;
-              void* ct  = fGetTransform(cam, nullptr);    if (!ct)  return nullptr;
-              g_cc.cam = cam; g_cc.pos = fGetPosition(ct, nullptr); g_cc.ts = now;
-              return &g_cc;
+              // dead zone with hysteresis, only while the target is not running: a moving target must not be released at 2 px
+              if (dist < 2.0f && slowT) g_holdLock = true; else if (dist > 5.0f || !slowT) g_holdLock = false;
+              if (g_holdLock) { g_stp0 *= 0.5f; g_stp1 *= 0.5f; g_lstp0 = g_lstp1 = 0.f; return; }
+
+              // stale-jacobian detector: the error keeps growing although we are really stepping. a strafing target also grows it for a
+              // while, so this only counts large errors with a real step behind them and needs ~2.5 s of it (was 60 frames: false
+              // recalibrations = visible probe jerks in the middle of a fight)
+              float stepMag = fabsf(g_lstp0) + fabsf(g_lstp1);
+              if (bi == g_lastTid && dist > 25.f && dist > g_lastBest + 0.5f && stepMag > 0.02f) {
+                  if (++g_grow > 150) { k.ok = false; k.st = 0; g_grow = 0; g_havePrev = false; aimDbg("recalibrating (error kept growing)", a[0], a[1], bdx, bdy, now); return; }
+              } else if (dist < g_lastBest && g_grow > 0) g_grow -= (g_grow > 2 ? 2 : g_grow);
+              g_lastBest = dist; g_lastTid = bi;
+
+              float tau  = (c.smooth < 1.f ? 1.f : c.smooth) * 14.f;    // ms, smooth 6 -> 84 ms time constant
+              // look-ahead: steer at where the error WILL be in ffT ms, cancels the steady lag a first-order loop has on a moving target
+              float ffT = tau * 0.5f; if (ffT > 45.f) ffT = 45.f;
+              float fx = g_vtX * ffT * off::AIM_FF, fy = g_vtY * ffT * off::AIM_FF;
+              float fm = sqrtf(fx * fx + fy * fy), lim = dist * 0.3f;   // never let the prediction outweigh the real error
+              if (fm > lim && fm > 1.0e-4f) { fx *= lim / fm; fy *= lim / fm; }
+              float ex = bdx + fx, ey = bdy + fy;
+
+              float frac = 1.f - expf(-dtms / tau); if (frac > 0.55f) frac = 0.55f;
+              float da0 = -( k.J11 * ex - k.J01 * ey) / k.det * frac;    // solve J * da = -err, take `frac` of it this frame
+              float da1 = -(-k.J10 * ex + k.J00 * ey) / k.det * frac;
+              float tauO = tau * 0.25f; if (tauO < 10.f) tauO = 10.f; if (tauO > 40.f) tauO = 40.f;
+              float ao = 1.f - expf(-dtms / tauO);                       // output low-pass in TIME (was a fixed 0.55 per frame: feel changed with fps)
+              g_stp0 += (da0 - g_stp0) * ao;
+              g_stp1 += (da1 - g_stp1) * ao;
+              float cap = off::AIM_STEP * dtms * (1.f / 16.67f); if (cap > 3.f * off::AIM_STEP) cap = 3.f * off::AIM_STEP;   // rate limit in deg/s, not deg/frame
+              if (g_stp0 >  cap) g_stp0 =  cap;
+              if (g_stp0 < -cap) g_stp0 = -cap;
+              if (g_stp1 >  cap) g_stp1 =  cap;
+              if (g_stp1 < -cap) g_stp1 = -cap;
+              a[0] += g_stp0; a[1] += g_stp1;
+              g_lstp0 = g_stp0; g_lstp1 = g_stp1;
+              aimDbg("engaged", a[0], a[1], bdx, bdy, now);             // err must shrink over successive lines
           }
 
           // runs on the Unity main thread, once per PlayerManager per frame
@@ -877,10 +1158,28 @@ jobs:
                   Slot* s = slotFor(self, now);
                   Ent& e = s->e;
                   e.fx = sf.x; e.fy = sf.y; e.hx = sk.x; e.hy = sk.y;
+                  s->wfeet = p;
+                  {                                                                        // horizontal velocity, sampled >=30 ms apart, low-passed
+                      float dt = (float)(now - s->pt) * 0.001f;
+                      if (s->pt && dt >= 0.03f && dt < 0.3f) {
+                          s->vel.x += ((p.x - s->pp.x) / dt - s->vel.x) * 0.35f;
+                          s->vel.z += ((p.z - s->pp.z) / dt - s->vel.z) * 0.35f;
+                          s->pp = p; s->pt = now;
+                      } else if (!s->pt || dt >= 0.3f) { s->vel = V3{0.f, 0.f, 0.f}; s->pp = p; s->pt = now; }
+                  }
+                  e.jmask = 0; s->jwMask = 0;
+                  if (g_shm->ctl.skel || g_shm->ctl.aim) {
+                      const uint32_t ALLJ = (1u << J_N) - 1, AIMJ = (1u << J_HEAD) | (1u << J_NECK) | (1u << J_CHEST) | (1u << J_HIPS);
+                      collectBones(self, s, cc, now, (g_shm->ctl.skel || g_shm->ctl.aimBone == 4) ? ALLJ : AIMJ);   // 12 calls instead of 48 per player
+                  }
                   e.hp = hp; e.hpMax = hpMax; e.dist = dist;
                   if (now - s->teamTs > 1000) {                                            // team string compare once a second, not per frame
                       Name t = readName(*(void**)((uintptr_t)self + off2::pm_team));
                       e.team = sameName(t, g_localTeam) ? 1 : 0; s->teamTs = now;
+                  }
+                  if (now - s->nameTs > 1000) {                                            // display name, once a second
+                      s->nameTs = now;
+                      toUtf8(readName(*(void**)((uintptr_t)ev + off2::ev_name)), e.name, (int)sizeof(e.name));
                   }
                   e.alive = true;
                   s->ts = now;
@@ -921,6 +1220,9 @@ jobs:
               fGetTransform = (ObjFn1)(g_base + rva::GetTransform);
               fGetPosition = (PosFn)(g_base + rva::GetPosition);
               fW2S = (W2SFn)(g_base + rva::W2S);
+              fGetBone = (BoneFn)(g_base + rva::GetBone);
+              fBalStep = (BalStepFn)(g_base + rva::BalStep);
+              fGetGO = (ObjFn1)(g_base + rva::GetGO); fGoActive = (BoolFn)(g_base + rva::GoActive);
 
               void* tramp = hookArm64(g_base + rva::Update, (void*)hk_update, rva::UpdatePrologue);
               if (!tramp) return nullptr;
@@ -968,6 +1270,9 @@ jobs:
           #include "ImGui/backends/imgui_impl_android.h"
           #include "ImGui/backends/imgui_impl_opengl3.h"
           #include "Android_touch/TouchHelperA.h"
+          #include <sys/socket.h>
+          #include <netdb.h>
+          #include <arpa/inet.h>
 
           #ifdef NOLOG
           #define LOG(...) ((void)0)
@@ -1193,6 +1498,9 @@ jobs:
               float menuOpacity = 0.92f;
               bool  aim = false, aimHold = false, aimTeam = false, aimCircle = true, noSpread = false;   // hold=false: engaged whenever a target is in fov
               float aimFov = 180.f, aimSmooth = 6.f, aimH = 0.85f, vfov = 60.f;        // fov in overlay px
+              bool  lead = false, names = true;   // lead: predict motion + drop;  leadSpeed 0 = auto from the equipped gun
+              float leadSpeed = 0.f;
+              int   aimBone = 4;      // 0 head, 1 neck, 2 chest, 3 pelvis, 4 closest joint to crosshair (aimH = fallback when no skeleton)
           } g_cfg;
 
           static void cfgSave() {
@@ -1201,12 +1509,13 @@ jobs:
                          "\"lines\":%d,\"team\":%d,\"maxDist\":%.0f,\"headH\":%.2f,"
                          "\"lw\":%.1f,\"opacity\":%.2f,"
                          "\"aim\":%d,\"aimHold\":%d,\"aimTeam\":%d,\"aimCircle\":%d,\"noSpread\":%d,"
-                         "\"aimFov\":%.0f,\"aimSmooth\":%.1f,\"aimH\":%.2f,\"vfov\":%.0f}\n",
+                         "\"aimFov\":%.0f,\"aimSmooth\":%.1f,\"aimH\":%.2f,\"vfov\":%.0f,\"aimBone\":%d,\"lead\":%d,\"leadSpeed\":%.0f,\"names\":%d}\n",
                   g_cfg.esp, g_cfg.box, g_cfg.hp, g_cfg.dist, g_cfg.skeleton,
                   g_cfg.lines, g_cfg.team, (double)g_cfg.maxDist, (double)g_cfg.headH,
                   (double)g_cfg.lineWidth, (double)g_cfg.menuOpacity,
                   g_cfg.aim, g_cfg.aimHold, g_cfg.aimTeam, g_cfg.aimCircle, g_cfg.noSpread,
-                  (double)g_cfg.aimFov, (double)g_cfg.aimSmooth, (double)g_cfg.aimH, (double)g_cfg.vfov);
+                  (double)g_cfg.aimFov, (double)g_cfg.aimSmooth, (double)g_cfg.aimH, (double)g_cfg.vfov, g_cfg.aimBone,
+                  g_cfg.lead, (double)g_cfg.leadSpeed, g_cfg.names);
               fclose(f);
           }
           static void cfgLoad() {
@@ -1238,6 +1547,10 @@ jobs:
               if (jd("aimSmooth", v)) g_cfg.aimSmooth = (float)v;
               if (jd("aimH", v))     g_cfg.aimH = (float)v;
               if (jd("vfov", v))     g_cfg.vfov = (float)v;
+              if (jd("aimBone", v))  g_cfg.aimBone = (int)v < 0 ? 0 : ((int)v > 4 ? 4 : (int)v);
+              if (jd("lead", v))     g_cfg.lead = v != 0;
+              if (jd("leadSpeed", v)) g_cfg.leadSpeed = (float)v;
+              if (jd("names", v))    g_cfg.names = v != 0;
           }
 
           // ── EGL / ImGui ───────────────────────────────────────────────────────────
@@ -1309,7 +1622,11 @@ jobs:
               const char* fonts[] = {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/NotoSans-Regular.ttf",
                                      "/system/fonts/DroidSans.ttf", "/system/fonts/NotoSansCJK-Regular.ttc"};
               for (const char* f : fonts)
+              #if IMGUI_VERSION_NUM < 19200
+                  if (access(f, R_OK) == 0 && io.Fonts->AddFontFromFileTTF(f, px, nullptr, io.Fonts->GetGlyphRangesCyrillic())) return;
+              #else
                   if (access(f, R_OK) == 0 && io.Fonts->AddFontFromFileTTF(f, px)) return;
+              #endif
               ImGui::GetStyle().FontSizeBase = px;   // fallback: scale built-in font (imgui >= 1.92)
           }
 
@@ -1510,6 +1827,7 @@ jobs:
                   Toggle("Box",         &g_cfg.box);
                   Toggle("Health bar",  &g_cfg.hp);
                   Toggle("Distance",    &g_cfg.dist);
+                  Toggle("Names",       &g_cfg.names);
                   Toggle("Skeleton",    &g_cfg.skeleton);
                   Toggle("Tracers",     &g_cfg.lines);
                   Toggle("Teammates",   &g_cfg.team);
@@ -1533,6 +1851,7 @@ jobs:
                   Toggle("Teammates",   &g_cfg.aimTeam);
                   Toggle("FOV circle",  &g_cfg.aimCircle);
                   Toggle("No spread",   &g_cfg.noSpread);
+                  Toggle("Lead target", &g_cfg.lead);
                   if (g_shm && !g_shm->ctl.ready)
                       ImGui::TextColored({1.f, 0.72f, 0.30f, 1.f}, "payload not ready (inject first)");
                   touchScroll();
@@ -1545,7 +1864,22 @@ jobs:
                   ImGui::Spacing();
                   SliderRow("Smoothing",   "##as", &g_cfg.aimSmooth, 1.f, 20.f,   "%.1f");
                   ImGui::Spacing();
-                  SliderRow("Aim height",  "##ah", &g_cfg.aimH,      0.3f, 1.0f,  "%.2f");
+                  SliderRow("Proj. speed (0=auto)", "##ls", &g_cfg.leadSpeed, 0.f, 800.f, "%.0f m/s");
+                  ImGui::Spacing();
+                  ImGui::TextDisabled("TARGET BONE");
+                  {
+                      static const char* const bn[5] = {"Head", "Neck", "Chest", "Pelvis", "Closest"};
+                      float bw = (ImGui::GetContentRegionAvail().x - st.ItemSpacing.x) * 0.5f;
+                      for (int i = 0; i < 5; i++) {
+                          bool on = g_cfg.aimBone == i;
+                          if (on) { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(ACC.x, ACC.y, ACC.z, 0.90f)); ImGui::PushStyleColor(ImGuiCol_Text, INK); }
+                          if (ImGui::Button(bn[i], {i == 4 ? -1.f : bw, 0})) g_cfg.aimBone = i;
+                          if (on) ImGui::PopStyleColor(2);
+                          if (i < 4 && (i & 1) == 0) ImGui::SameLine();
+                      }
+                  }
+                  ImGui::Spacing();
+                  SliderRow("Aim height (no skeleton)", "##ah", &g_cfg.aimH, 0.3f, 1.0f, "%.2f");
                   ImGui::Spacing();
                   SliderRow("Camera VFOV", "##av", &g_cfg.vfov,      30.f, 110.f, "%.0f deg");
                   touchScroll();
@@ -1620,10 +1954,54 @@ jobs:
                       dl->AddRect({x0 - 1, hy - 1}, {x1 + 1, fy + 1}, blk, 0, 0, lw + 2);
                       dl->AddRect({x0, hy}, {x1, fy}, col, 0, 0, lw);
                   }
+                  if (g_cfg.skeleton) {
+                      if (e.jmask) {                                       // real joints from Animator.GetBoneTransform
+                          auto JP = [&](int j, ImVec2& q) -> bool {
+                              if (!(e.jmask & (1u << j))) return false;
+                              q = {e.jx[j] * kx, ((float)g_sh - e.jy[j]) * ky}; return true;
+                          };
+                          static const int B[][2] = {
+                              {J_NECK, J_CHEST}, {J_CHEST, J_HIPS},
+                              {J_CHEST, J_LSH}, {J_LSH, J_LEL}, {J_LEL, J_LHA},
+                              {J_CHEST, J_RSH}, {J_RSH, J_REL}, {J_REL, J_RHA},
+                              {J_HIPS, J_LHIP}, {J_LHIP, J_LKN}, {J_LKN, J_LFT},
+                              {J_HIPS, J_RHIP}, {J_RHIP, J_RKN}, {J_RKN, J_RFT}};
+                          ImVec2 pa, pb, jh, jn, jc;
+                          bool hasH = JP(J_HEAD, jh), hasN = JP(J_NECK, jn), hasC = JP(J_CHEST, jc);
+                          for (int pass = 0; pass < 2; pass++) {
+                              ImU32 lc = pass == 0 ? blk : col; float lt = pass == 0 ? lw + 2.f : lw;
+                              for (auto& bb : B) if (JP(bb[0], pa) && JP(bb[1], pb)) dl->AddLine(pa, pb, lc, lt);
+                              if (hasH && hasN) dl->AddLine(jn, jh, lc, lt); else if (hasH && hasC) dl->AddLine(jc, jh, lc, lt);
+                              if (hasH) {
+                                  float r = hasN ? sqrtf((jh.x - jn.x) * (jh.x - jn.x) + (jh.y - jn.y) * (jh.y - jn.y)) * 0.8f : h * 0.07f;
+                                  if (r < 3.f) r = 3.f;
+                                  dl->AddCircle(jh, r, lc, 16, lt);
+                              }
+                          }
+                      } else {                                             // fallback: no humanoid animator -> proportional stick figure from the box
+                          float hipY = hy + h * 0.52f, shY = hy + h * 0.24f, hr = h * 0.07f;
+                          for (int pass = 0; pass < 2; pass++) {
+                              ImU32 lc = pass == 0 ? blk : col; float lt = pass == 0 ? lw + 2.f : lw;
+                              dl->AddCircle({cx, hy + hr}, hr, lc, 16, lt);
+                              dl->AddLine({cx, hy + hr * 2.f}, {cx, hipY}, lc, lt);
+                              dl->AddLine({cx - w * 0.55f, hy + h * 0.45f}, {cx, shY}, lc, lt);
+                              dl->AddLine({cx + w * 0.55f, hy + h * 0.45f}, {cx, shY}, lc, lt);
+                              dl->AddLine({cx, hipY}, {cx - w * 0.28f, fy}, lc, lt);
+                              dl->AddLine({cx, hipY}, {cx + w * 0.28f, fy}, lc, lt);
+                          }
+                      }
+                  }
                   if (g_cfg.hp && e.hpMax > 1.f) {
                       float f = e.hp / e.hpMax; f = f < 0 ? 0 : (f > 1 ? 1 : f);
                       dl->AddRectFilled({x0 - 9, hy - 1}, {x0 - 4, fy + 1}, blk);
                       dl->AddRectFilled({x0 - 8, fy - h * f}, {x0 - 5, fy}, IM_COL32((int)(255 * (1 - f)), (int)(255 * f), 0, 255));
+                  }
+                  if (g_cfg.names && e.name[0]) {
+                      float fs = ImGui::GetFontSize() * 0.75f;
+                      ImVec2 sz = ImGui::GetFont()->CalcTextSizeA(fs, 1e9f, 0.f, e.name);
+                      ImVec2 np = {cx - sz.x * 0.5f, hy - sz.y - 4.f};
+                      dl->AddText(ImGui::GetFont(), fs, {np.x + 1.f, np.y + 1.f}, IM_COL32(0, 0, 0, 220), e.name);
+                      dl->AddText(ImGui::GetFont(), fs, np, IM_COL32_WHITE, e.name);
                   }
                   if (g_cfg.dist) {
                       char t[24]; snprintf(t, sizeof(t), "%dm", (int)e.dist);
@@ -1655,19 +2033,178 @@ jobs:
               c.fov = g_cfg.aimFov * k; c.smooth = g_cfg.aimSmooth; c.aimH = g_cfg.aimH; c.vfov = g_cfg.vfov;
               c.maxDist = g_cfg.maxDist; c.aimTeam = g_cfg.aimTeam ? 1 : 0; c.noSpread = g_cfg.noSpread ? 1 : 0;
               c.active = active; c.aim = g_cfg.aim ? 1 : 0; c.esp = g_cfg.esp ? 1 : 0;
+              c.skel = (g_cfg.skeleton && g_cfg.esp) ? 1 : 0; c.aimBone = g_cfg.aimBone;
+              c.lead = g_cfg.lead ? 1 : 0; c.leadSpeed = g_cfg.leadSpeed;
           }
 
-          static int runOverlay() {
+          // ── license check (HOST side only) ───────────────────────────────────────────
+          // GET https://license-validator.gosthtoster.workers.dev/check?key=<KEY> over TLS.
+          // Uses Android's own libssl.so (BoringSSL, classic OpenSSL symbol names) via dlopen,
+          // so no TLS lib needs to be linked or bundled. Needs libssl.so/libcrypto.so on-device
+          // (stock on every Android) and internet access for the root shell.
+          namespace lic {
+              constexpr const char* HOST     = "license-validator.gosthtoster.workers.dev";
+              constexpr const char* PATH_FMT = "/check?key=%s";          // FILL: confirm path against the real worker route
+              constexpr const char* KEY_FILE = "/data/local/tmp/.tongdlc_key";
+          }
+
+          static int tcpConnect(const char* host, int port) {
+              addrinfo hints{}; hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+              addrinfo* res = nullptr;
+              char portStr[8]; snprintf(portStr, sizeof(portStr), "%d", port);
+              if (getaddrinfo(host, portStr, &hints, &res) != 0 || !res) return -1;
+              int fd = -1;
+              for (addrinfo* p = res; p; p = p->ai_next) {
+                  fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+                  if (fd < 0) continue;
+                  if (connect(fd, p->ai_addr, p->ai_addrlen) == 0) break;
+                  close(fd); fd = -1;
+              }
+              freeaddrinfo(res);
+              return fd;
+          }
+
+          // classic OpenSSL symbol names, resolved by hand: BoringSSL on-device keeps them for NDK/system compat,
+          // same pattern this project already uses for libgui.so in ANativeWindowCreator.h.
+          static bool httpsGet(const char* host, const char* path, char* out, size_t outCap) {
+              void* libssl = dlopen("libssl.so", RTLD_NOW);
+              if (!libssl) { EPRINT("license: libssl.so not found\n"); return false; }
+              auto TLS_client_method  = (void* (*)())dlsym(libssl, "TLS_client_method");
+              auto SSL_CTX_new        = (void* (*)(void*))dlsym(libssl, "SSL_CTX_new");
+              auto SSL_CTX_set_verify = (void  (*)(void*, int, void*))dlsym(libssl, "SSL_CTX_set_verify");
+              auto SSL_CTX_free       = (void  (*)(void*))dlsym(libssl, "SSL_CTX_free");
+              auto SSL_new            = (void* (*)(void*))dlsym(libssl, "SSL_new");
+              auto SSL_set_fd         = (int   (*)(void*, int))dlsym(libssl, "SSL_set_fd");
+              auto SSL_ctrl           = (long  (*)(void*, int, long, void*))dlsym(libssl, "SSL_ctrl");
+              auto SSL_connect        = (int   (*)(void*))dlsym(libssl, "SSL_connect");
+              auto SSL_write          = (int   (*)(void*, const void*, int))dlsym(libssl, "SSL_write");
+              auto SSL_read           = (int   (*)(void*, void*, int))dlsym(libssl, "SSL_read");
+              auto SSL_shutdown       = (int   (*)(void*))dlsym(libssl, "SSL_shutdown");
+              auto SSL_free           = (void  (*)(void*))dlsym(libssl, "SSL_free");
+              if (!TLS_client_method || !SSL_CTX_new || !SSL_new || !SSL_set_fd || !SSL_ctrl || !SSL_connect || !SSL_write || !SSL_read) {
+                  EPRINT("license: libssl symbol resolve failed (vendor BoringSSL layout differs)\n"); return false;
+              }
+
+              int fd = tcpConnect(host, 443);
+              if (fd < 0) { EPRINT("license: tcp connect failed (no network?)\n"); return false; }
+
+              void* ctx = SSL_CTX_new(TLS_client_method());
+              if (SSL_CTX_set_verify) SSL_CTX_set_verify(ctx, 0 /*SSL_VERIFY_NONE*/, nullptr);   // no system CA lookup from a root shell
+              void* ssl = SSL_new(ctx);
+              SSL_set_fd(ssl, fd);
+              SSL_ctrl(ssl, 55 /*SSL_CTRL_SET_TLSEXT_HOSTNAME*/, 0 /*TLSEXT_NAMETYPE_host_name*/, (void*)host);  // SNI, Cloudflare routes on it
+              if (SSL_connect(ssl) != 1) {
+                  EPRINT("license: TLS handshake failed\n");
+                  SSL_free(ssl); SSL_CTX_free(ctx); close(fd); return false;
+              }
+
+              char req[512];
+              int n = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: tongdlc\r\n\r\n", path, host);
+              SSL_write(ssl, req, n);
+
+              size_t total = 0;
+              while (total + 1 < outCap) {
+                  int r = SSL_read(ssl, out + total, (int)(outCap - 1 - total));
+                  if (r <= 0) break;
+                  total += (size_t)r;
+              }
+              out[total] = 0;
+              SSL_shutdown(ssl); SSL_free(ssl); SSL_CTX_free(ctx); close(fd);
+              return total > 0;
+          }
+
+          static bool licenseCheck(const char* key) {
+              if (!key || !key[0]) return false;
+              char path[256]; snprintf(path, sizeof(path), lic::PATH_FMT, key);
+              char resp[4096];
+              if (!httpsGet(lic::HOST, path, resp, sizeof(resp))) { EPRINT("license: request failed\n"); return false; }
+              bool httpOk = !strncmp(resp, "HTTP/1.1 2", 10) || !strncmp(resp, "HTTP/1.0 2", 10);
+              char* body = strstr(resp, "\r\n\r\n"); body = body ? body + 4 : resp;
+              // FILL: body contract assumed as {"valid":true,...} — adjust the needle below to match the real worker response
+              bool valid = httpOk && strstr(body, "\"valid\":true") != nullptr;
+              if (!valid) EPRINT("license: rejected (%.80s)\n", body);
+              return valid;
+          }
+          static void loadSavedKey(char* out, size_t cap) {
+              out[0] = 0;
+              FILE* f = fopen(lic::KEY_FILE, "r"); if (!f) return;
+              if (fgets(out, (int)cap, f)) {
+                  size_t n = strlen(out);
+                  while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+              }
+              fclose(f);
+          }
+          static void saveKey(const char* key) {
+              FILE* f = fopen(lic::KEY_FILE, "w"); if (!f) return;
+              fputs(key, f); fclose(f); chmod(lic::KEY_FILE, 0600);
+          }
+
+          // ── license lock screen — drawn instead of the menu until a valid key is entered ──
+          static char        g_keyBuf[128] = {};
+          static bool        g_licensed    = false;
+          static std::string g_licStatus;
+
+          static void drawLockScreen() {
+              ImGui::SetNextWindowPos({(float)g_scrW * 0.5f, (float)g_scrH * 0.5f}, ImGuiCond_Always, {0.5f, 0.5f});
+              ImGui::SetNextWindowSize({420.f, 0.f}, ImGuiCond_Always);
+              ImGui::Begin("License", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+              ImGui::TextWrapped("Enter your license key");
+              ImGui::SetNextItemWidth(-1.f);
+              bool enter = ImGui::InputText("##key", g_keyBuf, sizeof(g_keyBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_Password);
+              bool click = ImGui::Button("Unlock", {-1.f, 0.f});
+              if (!g_licStatus.empty()) ImGui::TextColored({1.f, 0.4f, 0.4f, 1.f}, "%s", g_licStatus.c_str());
+              if ((enter || click) && g_keyBuf[0]) {
+                  if (licenseCheck(g_keyBuf)) { saveKey(g_keyBuf); g_licensed = true; g_licStatus.clear(); }
+                  else g_licStatus = "invalid key";
+              }
+              ImGui::End();
+          }
+
+          // resolves the libcheat.so path the way main() used to (argv override / embedded / next to the binary)
+          static bool resolveLib(int argc, char** argv, bool overlayOnly, char* lib, size_t cap, bool& emb) {
+              emb = false;
+              if (overlayOnly) return true;
+              if (argc > 1) { snprintf(lib, cap, "%s", argv[1]); return true; }
+              #ifdef EMBED_PAYLOAD
+              emb = true; return true;
+              #else
+              char self[512] = {};
+              ssize_t r = readlink("/proc/self/exe", self, sizeof(self) - 1);
+              if (r <= 0) { perror("readlink"); return false; }
+              char* sl = strrchr(self, '/');
+              if (sl) { *sl = 0; snprintf(lib, cap, "%s/libcheat.so", self); } else snprintf(lib, cap, "./libcheat.so");
+              return true;
+              #endif
+          }
+
+          // usage: tongdlc [libcheat.so path]   |   tongdlc --overlay   (skip injection)
+          // injection now happens lazily, once the license lock screen accepts a key — the overlay (and the key
+          // input it draws) has to be up before that can happen at all.
+          static int runOverlay(int argc, char** argv) {
               if (!initEGL()) return 1;
               printf("[*] stage: imgui\n");
               initImGui();
               printf("[*] stage: touch\n");
               cfgLoad();
               Touch_Init(g_scrW, g_scrH, 0, true);
-              printf("[+] overlay up. tap [M] in the top-left corner. Ctrl-C to quit.\n");
+
+              loadSavedKey(g_keyBuf, sizeof(g_keyBuf));
+              g_licensed = g_keyBuf[0] && licenseCheck(g_keyBuf);
+              if (!g_licensed) g_keyBuf[0] = 0;              // don't prefill a key that just failed
+
+              bool overlayOnly = argc > 1 && !strcmp(argv[1], "--overlay");
+              bool injected = false;
+              printf("[+] overlay up. unlock with your license key, then tap [M] in the top-left corner. Ctrl-C to quit.\n");
 
               uint64_t lastOpen = 0;
               while (g_run) {
+                  if (g_licensed && !injected) {
+                      char lib[512]; bool emb = false;
+                      if (!resolveLib(argc, argv, overlayOnly, lib, sizeof(lib), emb)) { g_run = false; break; }
+                      injected = overlayOnly || injectLib(emb ? nullptr : lib);
+                      if (!injected) { EPRINT("inject failed\n"); g_run = false; break; }
+                  }
+
                   if (!g_shm && nowMs() - lastOpen > 1000) { lastOpen = nowMs(); shmTryOpen(); }
                   shmPoll();
                   Touch_UpdateImGui();
@@ -1675,9 +2212,7 @@ jobs:
                   ImGui_ImplOpenGL3_NewFrame();
                   ImGui_ImplAndroid_NewFrame();
                   ImGui::NewFrame();
-                  drawEsp();
-                  drawAim();
-                  drawMenu();
+                  if (g_licensed) { drawEsp(); drawAim(); drawMenu(); } else { drawLockScreen(); }
                   ImGui::Render();
 
                   glViewport(0, 0, g_dw, g_dh);
@@ -1699,35 +2234,14 @@ jobs:
               return 0;
           }
 
-          // usage: tongdlc [libcheat.so path]   |   tongdlc --overlay   (skip injection)
           int main(int argc, char** argv) {
               if (geteuid() != 0) { EPRINT("need root\n"); return 1; }
               signal(SIGINT, onSig); signal(SIGTERM, onSig);
               { struct sigaction sa{}; sa.sa_sigaction = crashHandler; sa.sa_flags = SA_SIGINFO | SA_RESETHAND; sigemptyset(&sa.sa_mask);
                 for (int s : {SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGFPE}) sigaction(s, &sa, nullptr); }
               setvbuf(stdout, nullptr, _IONBF, 0);
-
-              bool overlayOnly = argc > 1 && !strcmp(argv[1], "--overlay");
-              if (!overlayOnly) {
-                  char lib[512]; bool emb = false;
-                  if (argc > 1) snprintf(lib, sizeof(lib), "%s", argv[1]);
-                  #ifdef EMBED_PAYLOAD
-                  else emb = true;
-                  #else
-                  else {
-                      char self[512] = {};
-                      ssize_t r = readlink("/proc/self/exe", self, sizeof(self) - 1);
-                      if (r <= 0) { perror("readlink"); return 1; }
-                      char* sl = strrchr(self, '/');
-                      if (sl) { *sl = 0; snprintf(lib, sizeof(lib), "%s/libcheat.so", self); }
-                      else snprintf(lib, sizeof(lib), "./libcheat.so");
-                  }
-                  #endif
-                  if (!injectLib(emb ? nullptr : lib)) return 1;
-              }
-              return runOverlay();
+              return runOverlay(argc, argv);
           }
-
           #endif // PAYLOAD
           OXEOF
           wc -l cheat.cpp
