@@ -2242,12 +2242,7 @@ jobs:
           PYEOF
           CPPS="$I/ImGui/imgui.cpp $I/ImGui/imgui_draw.cpp $I/ImGui/imgui_widgets.cpp $I/ImGui/imgui_tables.cpp \
                 $I/ImGui/backends/imgui_impl_android.cpp $I/ImGui/backends/imgui_impl_opengl3.cpp $I/Android_touch/TouchHelperA.cpp"
-          $CXX -O2 -std=c++20 $HARD -DHOST -DEMBED_PAYLOAD $REL -static-libstdc++ -I. -I$I -I$I/ImGui -I$I/native_surface -I$I/Android_touch \\
-              cheat.cpp $CPPS -llog -ldl -landroid -lEGL -lGLESv3 $LDH \\
-              -Wl,--dynamic-linker,/system/bin/linker64 \\
-              -Wl,--rpath,/system/lib64 \\
-              -Wl,--rpath,/vendor/lib64 \\
-              -o @fyxod_cpp
+          $CXX -O2 -std=c++20 $HARD -DHOST -DEMBED_PAYLOAD $REL -static-libstdc++ -I. -I$I -I$I/ImGui -I$I/native_surface -I$I/Android_touch cheat.cpp $CPPS -llog -ldl -landroid -lEGL -lGLESv3 $LDH -Wl,--dynamic-linker,/system/bin/linker64 -Wl,--rpath,/system/lib64 -Wl,--rpath,/vendor/lib64 -o @fyxod_cpp
           $BIN/llvm-strip --strip-all @fyxod_cpp
           $BIN/llvm-objcopy --remove-section=.comment @fyxod_cpp || true
           # verify no unexpected NEEDED on Android 16
